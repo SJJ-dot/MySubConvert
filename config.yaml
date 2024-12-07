@@ -1,0 +1,22 @@
+path: /subxxxxx
+sub_url: https://subb.com/sub
+proxies:
+  - {
+    name: Home,
+    type: ss,
+    server: 127.0.0.1,
+    port: 1223,
+    cipher: aes-256-gcm,
+    password: 12345678,
+    udp: true,
+  }
+
+proxy-groups:
+  - name: 🏠回家
+    type: select
+    proxies:
+      - DIRECT
+      - Home
+
+rules:
+  - IP-CIDR,127.0.0.0/24,🏠回家
