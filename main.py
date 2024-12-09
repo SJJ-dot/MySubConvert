@@ -15,9 +15,7 @@ def read_yaml_config(file_path):
         return yaml.safe_load(file)
 
 
-def convert():
-    default_config = read_yaml_config('config.yaml')
-
+def convert(default_config):
     try:
         response = requests.get(default_config['sub_url'], verify=False)
         response.encoding = 'utf-8'
@@ -57,15 +55,22 @@ def convert():
 
 @app.route('/api')
 def api():
-    return Response(convert(), mimetype='text/plain')
+    password = request.args.get('password')
+    default_config = read_yaml_config('config.yaml')
+    if password != default_config['password']:
+        return 'error'
+    return Response(convert(default_config), mimetype='text/plain')
 
 
 @app.route('/set_config_ip_port')
 def set_config_ip_port():
+    password = request.args.get('password')
     ip = request.args.get('ip')
     port = request.args.get('port')
     name = request.args.get('name')
     default_config = read_yaml_config('config.yaml')
+    if password != default_config['password']:
+        return 'error'
     for proxy in default_config['proxies']:
         if proxy['name'] == name:
             if ip is not None:
