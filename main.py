@@ -53,7 +53,7 @@ def convert(default_config):
     return yaml.dump(default_config, allow_unicode=True, sort_keys=False)
 
 
-@app.route('/api')
+@app.route(read_yaml_config('config.yaml')['api_path'])
 def api():
     password = request.args.get('password')
     default_config = read_yaml_config('config.yaml')
