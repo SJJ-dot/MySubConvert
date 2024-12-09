@@ -58,7 +58,7 @@ def api():
     password = request.args.get('password')
     default_config = read_yaml_config('config.yaml')
     if password != default_config['password']:
-        return 'error'
+        return 'Hello World!'
     return Response(convert(default_config), mimetype='text/plain')
 
 
@@ -70,7 +70,7 @@ def set_config_ip_port():
     name = request.args.get('name')
     default_config = read_yaml_config('config.yaml')
     if password != default_config['password']:
-        return 'error'
+        return 'Hello World!'
     for proxy in default_config['proxies']:
         if proxy['name'] == name:
             if ip is not None:
