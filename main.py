@@ -22,16 +22,16 @@ def convert(default_config):
         content = yaml.safe_load(response.text)
         tmp = OrderedDict()
         # 合并并去重 proxies
-        for proxy in default_config['proxies']:
-            tmp[proxy['name']] = proxy
         for proxy in content['proxies']:
+            tmp[proxy['name']] = proxy
+        for proxy in default_config['proxies']:
             tmp[proxy['name']] = proxy
         content['proxies'] = list(tmp.values())
         # 合并并去重 proxy-groups
         tmp = OrderedDict()
-        for group in default_config['proxy-groups']:
-            tmp[group['name']] = group
         for group in content['proxy-groups']:
+            tmp[group['name']] = group
+        for group in default_config['proxy-groups']:
             tmp[group['name']] = group
         content['proxy-groups'] = list(tmp.values())
         # 合并并去重 rules
