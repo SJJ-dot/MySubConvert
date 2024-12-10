@@ -1,23 +1,23 @@
-api_path: /api
-password: 12345678
-sub_url: https://subb.com/sub
-proxies:
+api_path: /api # 用于获取订阅信息的接口路径，如：/api  请求方式：GET
+password: 12345678 # 请求接口的密码
+sub_url: https://subb.com/sub # 订阅地址
+proxies: # 自己的节点信息
   - {
-    name: Home,
-    type: ss,
-    server: 127.0.0.1,
-    port: 1223,
-    cipher: aes-256-gcm,
-    password: 12345678,
-    udp: true,
+    name: Home, # 节点名称
+    type: ss, # 节点类型
+    server: 127.0.0.1, # 节点对外地址（公网）
+    port: 1223, # 节点对外端口（公网）
+    cipher: aes-256-gcm, # 加密方式
+    password: 12345678, # 密码
+    udp: true, # 是否开启UDP
   }
 
-proxy-groups:
-  - name: 🏠回家
-    type: select
-    proxies:
-      - DIRECT
-      - Home
+proxy-groups: # 代理组
+  - name: 🏠回家 # 代理组名称
+    type: select # 代理组类型
+    proxies: # 代理组包含的节点
+      - DIRECT # 直连
+      - Home # 节点名称
 
-rules:
-  - IP-CIDR,127.0.0.0/24,🏠回家
+rules: # 规则
+  - IP-CIDR,127.0.0.0/24,🏠回家 # 本地地址直连

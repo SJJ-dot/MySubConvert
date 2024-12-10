@@ -16,9 +16,11 @@ def read_yaml_config(file_path):
 
 
 def convert(default_config):
+    subscription_userinfo = ''
     try:
         response = requests.get(default_config['sub_url'], verify=False)
         response.encoding = 'utf-8'
+        subscription_userinfo = response.headers.get('subscription-userinfo', '')
         content = yaml.safe_load(response.text)
         tmp = OrderedDict()
         # 合并并去重 proxies
@@ -50,7 +52,7 @@ def convert(default_config):
         del default_config['sub_url']
     if 'path' in default_config:
         del default_config['path']
-    return yaml.dump(default_config, allow_unicode=True, sort_keys=False)
+    return yaml.dump(default_config, allow_unicode=True, sort_keys=False),subscription_userinfo
 
 
 @app.route(read_yaml_config('config.yaml')['api_path'])
@@ -59,7 +61,11 @@ def api():
     default_config = read_yaml_config('config.yaml')
     if password != default_config['password']:
         return 'Hello World!'
-    return Response(convert(default_config), mimetype='text/plain')
+    yaml,subscription_userinfo = convert(default_config)
+    headers = {}
+    if subscription_userinfo != '':
+        headers['subscription-userinfo'] = subscription_userinfo
+    return Response(yaml, mimetype='text/plain', headers=headers)
 
 
 @app.route('/set_config_ip_port')
