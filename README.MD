@@ -16,3 +16,8 @@
 - 请求方式： `get`
 - 路径：`/api` ，和配置文件中的 `api_path` 一致
 - 参数：`password` ，和配置文件中的 `password` ,请求接口的密码
+
+### docker
+```
+docker pull ghcr.io/sjj-dot/mysubconvert:latest
+```
