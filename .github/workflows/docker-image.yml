@@ -28,4 +28,4 @@ jobs:
         uses: docker/build-push-action@v4
         with:
           push: true
-          tags: ghcr.io/SJJ-dot/mysubconvert:latest  # 镜像标签为 "latest"
+          tags: ghcr.io/sjj-dot/mysubconvert:latest  # 镜像标签为 "latest"
