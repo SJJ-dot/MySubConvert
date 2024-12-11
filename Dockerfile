@@ -17,4 +17,4 @@ COPY . .
 EXPOSE 5000
 
 # 定义运行 Flask 应用程序的命令
-CMD ["python", "main.py"]
+CMD ["gunicorn", "-w", "1", "-b", "0.0.0.0:5000", "main:app"]
