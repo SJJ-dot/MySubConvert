@@ -1,8 +1,9 @@
+import random
 from collections import OrderedDict
 
-from flask import Flask, request, Response
-import yaml
 import requests
+import yaml
+from flask import Flask, request, Response
 from urllib3.exceptions import InsecureRequestWarning
 
 # Suppress only the single InsecureRequestWarning from urllib3
@@ -18,7 +19,14 @@ def read_yaml_config(file_path):
 def convert(default_config):
     subscription_userinfo = ''
     try:
-        response = requests.get(default_config['sub_url'], verify=False)
+        headers = {
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+        params = {
+            "__t": str(random.randint(1000000000, 9999999999))
+        }
+        response = requests.get(default_config['sub_url'], headers=headers, verify=False, params=params)
         response.encoding = 'utf-8'
         subscription_userinfo = response.headers.get('subscription-userinfo', '')
         content = yaml.safe_load(response.text)
@@ -52,7 +60,7 @@ def convert(default_config):
         del default_config['sub_url']
     if 'path' in default_config:
         del default_config['path']
-    return yaml.dump(default_config, allow_unicode=True, sort_keys=False),subscription_userinfo
+    return yaml.dump(default_config, allow_unicode=True, sort_keys=False), subscription_userinfo
 
 
 @app.route(read_yaml_config('config.yaml')['api_path'])
@@ -61,7 +69,7 @@ def api():
     default_config = read_yaml_config('config.yaml')
     if password != default_config['password']:
         return 'Hello World!'
-    yaml,subscription_userinfo = convert(default_config)
+    yaml, subscription_userinfo = convert(default_config)
     headers = {}
     if subscription_userinfo != '':
         headers['subscription-userinfo'] = subscription_userinfo
