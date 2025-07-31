@@ -5,6 +5,7 @@ import requests
 import yaml
 from flask import Flask, request, Response
 from urllib3.exceptions import InsecureRequestWarning
+import base64
 
 # Suppress only the single InsecureRequestWarning from urllib3
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
@@ -69,6 +70,7 @@ def api():
     default_config = read_yaml_config('config.yaml')
     if password != default_config['password']:
         return 'Hello World!'
+    get_proxy_ip_port(default_config)
     yaml, subscription_userinfo = convert(default_config)
     headers = {}
     if subscription_userinfo != '':
@@ -76,24 +78,31 @@ def api():
     return Response(yaml, mimetype='text/plain', headers=headers)
 
 
-@app.route('/set_config_ip_port')
-def set_config_ip_port():
-    password = request.args.get('password')
-    ip = request.args.get('ip')
-    port = request.args.get('port')
-    name = request.args.get('name')
-    default_config = read_yaml_config('config.yaml')
-    if password != default_config['password']:
-        return 'Hello World!'
-    for proxy in default_config['proxies']:
-        if proxy['name'] == name:
-            if ip is not None:
-                proxy['server'] = ip
-            if port is not None:
-                proxy['port'] = int(port)
-    with open('config.yaml', 'w', encoding='utf-8') as file:
-        yaml.dump(default_config, file, allow_unicode=True, sort_keys=False)
-    return 'ok'
+def get_proxy_ip_port(default_config = None):
+    if default_config is None:
+        default_config = read_yaml_config('config.yaml')
+    basic_auth = default_config.get('basic_auth')
+    url = default_config.get('server_url')
+    headers = {}
+    if basic_auth:
+        encoded = base64.b64encode(basic_auth.encode('utf-8')).decode('utf-8')
+        headers['Authorization'] = 'Basic ' + encoded
+    response = requests.get(url, headers=headers, verify=False)
+    response.encoding = 'utf-8'
+    if response.status_code == 200:
+        data = response.json() # {'ip': 'xxx.xxx.xxx.xxx', 'port': 12345}
+        ip = data.get('ip')
+        port = data.get('port')
+        for proxy in default_config['proxies']:
+            if proxy['name'] == "Home":
+                if ip is not None:
+                    proxy['server'] = ip
+                if port is not None:
+                    proxy['port'] = int(port)
+        with open('config.yaml', 'w', encoding='utf-8') as file:
+            yaml.dump(default_config, file, allow_unicode=True, sort_keys=False)
+    else:
+        print(f"Failed to get proxy IP and port. Status code: {response.status_code}")
 
 
 if __name__ == '__main__':
