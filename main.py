@@ -57,10 +57,16 @@ def convert(default_config):
         default_config = content
     except Exception as e:
         print("Error: %s" % e)
+    if "api_path" in default_config:
+        del default_config['api_path']
+    if 'password' in default_config:
+        del default_config['password']
     if 'sub_url' in default_config:
         del default_config['sub_url']
-    if 'path' in default_config:
-        del default_config['path']
+    if "basic_auth" in default_config:
+        del default_config['basic_auth']
+    if 'server_url' in default_config:
+        del default_config['server_url']
     return yaml.dump(default_config, allow_unicode=True, sort_keys=False), subscription_userinfo
 
 
@@ -68,7 +74,7 @@ def convert(default_config):
 def api():
     password = request.args.get('password')
     default_config = read_yaml_config('config.yaml')
-    if password != default_config['password']:
+    if password != str(default_config['password']):
         return 'Hello World!'
     get_proxy_ip_port(default_config)
     yaml, subscription_userinfo = convert(default_config)
@@ -79,30 +85,37 @@ def api():
 
 
 def get_proxy_ip_port(default_config = None):
-    if default_config is None:
-        default_config = read_yaml_config('config.yaml')
-    basic_auth = default_config.get('basic_auth')
-    url = default_config.get('server_url')
-    headers = {}
-    if basic_auth:
-        encoded = base64.b64encode(basic_auth.encode('utf-8')).decode('utf-8')
-        headers['Authorization'] = 'Basic ' + encoded
-    response = requests.get(url, headers=headers, verify=False)
-    response.encoding = 'utf-8'
-    if response.status_code == 200:
-        data = response.json() # {'ip': 'xxx.xxx.xxx.xxx', 'port': 12345}
-        ip = data.get('ip')
-        port = data.get('port')
-        for proxy in default_config['proxies']:
-            if proxy['name'] == "Home":
-                if ip is not None:
-                    proxy['server'] = ip
-                if port is not None:
-                    proxy['port'] = int(port)
-        with open('config.yaml', 'w', encoding='utf-8') as file:
-            yaml.dump(default_config, file, allow_unicode=True, sort_keys=False)
-    else:
-        print(f"Failed to get proxy IP and port. Status code: {response.status_code}")
+    try:
+        if default_config is None:
+            default_config = read_yaml_config('config.yaml')
+        basic_auth = default_config.get('basic_auth')
+        url = default_config.get('server_url')
+        if basic_auth is None or url is None:
+            print("basic_auth or server_url is None")
+            return
+        headers = {}
+        if basic_auth:
+            encoded = base64.b64encode(basic_auth.encode('utf-8')).decode('utf-8')
+            headers['Authorization'] = 'Basic ' + encoded
+        response = requests.get(url, headers=headers, verify=False)
+        response.encoding = 'utf-8'
+        if response.status_code == 200:
+            data = response.json() # {'ip': 'xxx.xxx.xxx.xxx', 'port': 12345}
+            ip = data.get('ip')
+            port = data.get('port')
+            if ip is None or port is None:
+                print("ip or port is None")
+                return
+            for proxy in default_config['proxies']:
+                proxy['server'] = ip
+                proxy['port'] = int(port)
+            with open('config.yaml', 'w', encoding='utf-8') as file:
+                yaml.dump(default_config, file, allow_unicode=True, sort_keys=False)
+        else:
+            print(f"Failed to get proxy IP and port. Status code: {response.status_code}")
+    except Exception as e:
+        print(f"Failed to get proxy IP and port. Error: {e}")
+        pass
 
 
 if __name__ == '__main__':
