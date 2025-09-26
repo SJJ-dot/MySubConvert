@@ -17,7 +17,7 @@ def read_yaml_config(file_path):
         return yaml.safe_load(file)
 
 
-def convert(default_config):
+def convert(default_config, sub_url):
     subscription_userinfo = ''
     try:
         headers = {
@@ -27,7 +27,7 @@ def convert(default_config):
         params = {
             "__t": str(random.randint(1000000000, 9999999999))
         }
-        response = requests.get(default_config['sub_url'], headers=headers, verify=False, params=params)
+        response = requests.get(sub_url, headers=headers, verify=False, params=params)
         response.encoding = 'utf-8'
         subscription_userinfo = response.headers.get('subscription-userinfo', '')
         content = yaml.safe_load(response.text)
@@ -72,19 +72,20 @@ def convert(default_config):
 
 @app.route(read_yaml_config('config.yaml')['api_path'])
 def api():
+    sub_url = request.args.get('sub_url')
     password = request.args.get('password')
     default_config = read_yaml_config('config.yaml')
-    if password != str(default_config['password']):
+    if password != str(default_config.get('password', '')):
         return 'Hello World!'
     get_proxy_ip_port(default_config)
-    yaml, subscription_userinfo = convert(default_config)
+    yaml, subscription_userinfo = convert(default_config, sub_url if sub_url else default_config.get('sub_url', ''))
     headers = {}
     if subscription_userinfo != '':
         headers['subscription-userinfo'] = subscription_userinfo
     return Response(yaml, mimetype='text/plain', headers=headers)
 
 
-def get_proxy_ip_port(default_config = None):
+def get_proxy_ip_port(default_config=None):
     try:
         if default_config is None:
             default_config = read_yaml_config('config.yaml')
@@ -100,7 +101,7 @@ def get_proxy_ip_port(default_config = None):
         response = requests.get(url, headers=headers, verify=False)
         response.encoding = 'utf-8'
         if response.status_code == 200:
-            data = response.json() # {'ip': 'xxx.xxx.xxx.xxx', 'port': 12345}
+            data = response.json()  # {'ip': 'xxx.xxx.xxx.xxx', 'port': 12345}
             ip = data.get('ip')
             port = data.get('port')
             if ip is None or port is None:
