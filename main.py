@@ -10,6 +10,11 @@ import base64
 # Suppress only the single InsecureRequestWarning from urllib3
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 app = Flask(__name__)
+# logger
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 
 def read_yaml_config(file_path):
@@ -20,17 +25,21 @@ def read_yaml_config(file_path):
 def convert(default_config, sub_url):
     subscription_userinfo = ''
     try:
-        headers = {
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-        }
-        params = {
-            "__t": str(random.randint(1000000000, 9999999999))
-        }
-        response = requests.get(sub_url, headers=headers, verify=False, params=params)
-        response.encoding = 'utf-8'
-        subscription_userinfo = response.headers.get('subscription-userinfo', '')
-        content = yaml.safe_load(response.text)
+        try:
+            headers = {
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+            }
+            params = {
+                "__t": str(random.randint(1000000000, 9999999999))
+            }
+            response = requests.get(sub_url, headers=headers, verify=False, params=params)
+            response.encoding = 'utf-8'
+            subscription_userinfo = response.headers.get('subscription-userinfo', '')
+            content = yaml.safe_load(response.text)
+        except Exception as e:
+            logging.error("Error loading YAML: %s" % e)
+            content = read_yaml_config('template.yaml')
         tmp = OrderedDict()
         # 合并并去重 proxies
         for proxy in content['proxies']:
@@ -56,7 +65,7 @@ def convert(default_config, sub_url):
         content['rules'] = tmp
         default_config = content
     except Exception as e:
-        print("Error: %s" % e)
+        logging.error("Error: %s" % e)
     if "api_path" in default_config:
         del default_config['api_path']
     if 'password' in default_config:
@@ -92,7 +101,7 @@ def get_proxy_ip_port(default_config=None):
         basic_auth = default_config.get('basic_auth')
         url = default_config.get('server_url')
         if basic_auth is None or url is None:
-            print("basic_auth or server_url is None")
+            logging.info("basic_auth or server_url is None")
             return
         headers = {}
         if basic_auth:
@@ -105,7 +114,7 @@ def get_proxy_ip_port(default_config=None):
             ip = data.get('ip')
             port = data.get('port')
             if ip is None or port is None:
-                print("ip or port is None")
+                logging.info("ip or port is None")
                 return
             for proxy in default_config['proxies']:
                 proxy['server'] = ip
@@ -113,9 +122,9 @@ def get_proxy_ip_port(default_config=None):
             with open('config.yaml', 'w', encoding='utf-8') as file:
                 yaml.dump(default_config, file, allow_unicode=True, sort_keys=False)
         else:
-            print(f"Failed to get proxy IP and port. Status code: {response.status_code}")
+            logging.info(f"Failed to get proxy IP and port. Status code: {response.status_code}")
     except Exception as e:
-        print(f"Failed to get proxy IP and port. Error: {e}")
+        logging.error(f"Failed to get proxy IP and port. Error: {e}")
         pass
 
 
