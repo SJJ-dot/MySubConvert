@@ -24,6 +24,7 @@ else:
     # 非 gunicorn 运行时回退到基本配置
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+
 @app.before_request
 def log_request():
     g.start_time = time.time()
@@ -50,6 +51,7 @@ def log_request():
         body
     )
 
+
 @app.after_request
 def log_response(response):
     duration = time.time() - getattr(g, 'start_time', time.time())
@@ -63,15 +65,20 @@ def log_response(response):
     )
     return response
 
+
 def read_yaml_config(file_path):
     with open(file_path, 'r', encoding='utf-8') as file:
         return yaml.safe_load(file)
+
+
+cache_yaml = {}
 
 
 def convert(default_config, sub_url):
     subscription_userinfo = ''
     try:
         try:
+            logging.info("Loading YAML from %s" % sub_url)
             headers = {
                 "Cache-Control": "no-cache",
                 "Pragma": "no-cache",
@@ -83,9 +90,19 @@ def convert(default_config, sub_url):
             response.encoding = 'utf-8'
             subscription_userinfo = response.headers.get('subscription-userinfo', '')
             content = yaml.safe_load(response.text)
+            cache_yaml[sub_url] = content
+            cache_yaml[sub_url + 'subscription_userinfo'] = subscription_userinfo
+            logging.info("YAML loaded successfully from %s" % sub_url)
         except Exception as e:
             logging.error("Error loading YAML: %s" % e)
-            content = read_yaml_config('template.yaml')
+            if sub_url in cache_yaml:
+                logging.info("Using cached YAML for %s" % sub_url)
+                content = cache_yaml[sub_url]
+                subscription_userinfo = cache_yaml.get(sub_url + 'subscription_userinfo', '')
+                logging.info("Cached YAML loaded successfully for %s" % sub_url)
+            else:
+                content = read_yaml_config('template.yaml')
+                logging.info("Using local template.yaml as fallback")
         tmp = OrderedDict()
         # 合并并去重 proxies
         for proxy in content['proxies']:
