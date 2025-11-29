@@ -79,14 +79,7 @@ def convert(default_config, sub_url):
     try:
         try:
             logging.info("Loading YAML from %s" % sub_url)
-            headers = {
-                "Cache-Control": "no-cache",
-                "Pragma": "no-cache",
-            }
-            params = {
-                "__t": str(random.randint(1000000000, 9999999999))
-            }
-            response = requests.get(sub_url, headers=headers, verify=False, params=params, timeout=60)
+            response = requests.get(sub_url, verify=False, timeout=60)
             response.encoding = 'utf-8'
             subscription_userinfo = response.headers.get('subscription-userinfo', '')
             content = yaml.safe_load(response.text)
