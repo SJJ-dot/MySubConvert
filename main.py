@@ -1,3 +1,6 @@
+from gevent import monkey
+monkey.patch_all()
+
 import random
 from collections import OrderedDict
 
@@ -79,7 +82,8 @@ def convert(default_config, sub_url):
     try:
         try:
             logging.info("Loading YAML from %s" % sub_url)
-            response = requests.get(sub_url, verify=False, timeout=60)
+            # use (connect, read) timeouts so a slow SSL handshake or read won't block forever
+            response = requests.get(sub_url, verify=False, timeout=(5, 50))
             response.encoding = 'utf-8'
             subscription_userinfo = response.headers.get('subscription-userinfo', '')
             content = yaml.safe_load(response.text)
@@ -164,7 +168,8 @@ def get_proxy_ip_port(default_config=None):
         if basic_auth:
             encoded = base64.b64encode(basic_auth.encode('utf-8')).decode('utf-8')
             headers['Authorization'] = 'Basic ' + encoded
-        response = requests.get(url, headers=headers, verify=False)
+        # add a reasonable timeout so this call doesn't block forever
+        response = requests.get(url, headers=headers, verify=False, timeout=(5, 15))
         response.encoding = 'utf-8'
         if response.status_code == 200:
             data = response.json()  # {'ip': 'xxx.xxx.xxx.xxx', 'port': 12345}
