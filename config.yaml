@@ -5,24 +5,9 @@ basic_auth: admin:123456 # 获取代理节点信息：基础认证，格式为 u
 server_url:  # 获取代理节点信息,服务地址。默认忽略
 
 #代理信息模板
-proxies: # 自己的节点信息
-  - {
-    name: Home, # 节点名称
-    type: ss, # 节点类型
-    server: 127.0.0.1, # 节点对外地址（公网）
-    port: 1223, # 节点对外端口（公网）
-    cipher: aes-256-gcm, # 加密方式
-    password: 12345678, # 密码
-    udp: true, # 是否开启UDP
-  }
+proxies: [] # 自己的节点信息
 
-proxy-groups: # 代理组
-  - name: 🏠回家 # 代理组名称
-    type: select # 代理组类型
-    proxies: # 代理组包含的节点
-      - DIRECT # 直连
-      - Home # 节点名称
+proxy-groups: [] # 代理组
 
-rules: # 规则
-  - IP-CIDR,127.0.0.0/24,🏠回家 # 本地地址直连
+rules: [] # 规则
 

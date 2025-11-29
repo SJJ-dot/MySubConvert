@@ -6,16 +6,7 @@ mode: Rule          # 运行模式：Rule(规则)、Global(全局)、Direct(直�
 log-level: info     # 日志级别
 external-controller: 127.0.0.1:9090
 # 代理节点配置
-proxies:
-  - {
-    name: Home, # 节点名称
-    type: ss, # 节点类型
-    server: 127.0.0.1, # 节点对外地址（公网）
-    port: 1223, # 节点对外端口（公网）
-    cipher: aes-256-gcm, # 加密方式
-    password: 12345678, # 密码
-    udp: true, # 是否开启UDP
-  }
+proxies: []
 
 # 代理组配置
 proxy-groups:
@@ -23,7 +14,6 @@ proxy-groups:
     type: select # 代理组类型
     proxies: # 代理组包含的节点
       - DIRECT # 直连
-      - Home # 节点名称
 # 规则配置
 rules:
   # 默认所有流量直连
