@@ -18,55 +18,98 @@ app = Flask(__name__)
 # logger
 import logging
 
-# 在 gunicorn 下复用其 error logger 的 handler，保证 logging.info 能输出到 gunicorn 管理的 stderr/stdout
-gunicorn_logger = logging.getLogger('gunicorn.error')
-if gunicorn_logger.handlers:
-    logging.root.handlers = gunicorn_logger.handlers
-    logging.root.setLevel(gunicorn_logger.level)
-else:
-    # 非 gunicorn 运行时回退到基本配置
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+def configure_logging(app):
+    fmt = '%(asctime)s - %(levelname)s - %(name)s - %(message)s'
+    formatter = logging.Formatter(fmt)
+
+    gunicorn_error = logging.getLogger('gunicorn.error')
+    gunicorn_access = logging.getLogger('gunicorn.access')
+
+    if gunicorn_error.handlers:
+        # 复用 gunicorn 的 handlers，但强制统一 formatter & level
+        handlers = gunicorn_error.handlers[:]
+        root_level = gunicorn_error.level
+    else:
+        logging.basicConfig(level=logging.INFO, format=fmt)
+        handlers = logging.root.handlers[:]
+        root_level = logging.root.level
+
+    # 强制为所有 handler 设定统一 formatter
+    for h in handlers:
+        h.setFormatter(formatter)
+
+    logging.root.handlers = handlers
+    logging.root.setLevel(root_level)
+
+    # 统一绑定到 app.logger、werkzeug、以及 gunicorn.access（如果存在）
+    app.logger.handlers = handlers[:]
+    app.logger.setLevel(root_level)
+    app.logger.propagate = False
+
+    werkzeug_logger = logging.getLogger('werkzeug')
+    werkzeug_logger.handlers = handlers[:]
+    werkzeug_logger.setLevel(root_level)
+    werkzeug_logger.propagate = False
 
 
+    if gunicorn_access.handlers:
+        gunicorn_access.handlers = handlers[:]
+        gunicorn_access.setLevel(root_level)
+        gunicorn_access.propagate = False
+
+configure_logging(app)
+
+# python
 @app.before_request
 def log_request():
     g.start_time = time.time()
-    # 读取并缓存请求体（不会二次消费）
     raw = request.get_data(cache=True)
     try:
         body = raw.decode('utf-8', errors='replace')
     except Exception:
         body = '<binary>'
-    # 限制长度，避免日志过大
     if len(body) > 2000:
         body = body[:2000] + '...[truncated]'
-    # 遮蔽敏感参数
-    args = request.args.to_dict()
-    if 'password' in args:
-        args['password'] = '***'
+
+    # 使用 flat=False 保留多值参数，然后把密码脱敏并重建查询串
+    from urllib.parse import urlencode
+    args_multi = request.args.to_dict(flat=False)
+    sanitized_args = {}
+    for k, v in args_multi.items():
+        if k.lower() == 'password':
+            sanitized_args[k] = ['***']
+        else:
+            sanitized_args[k] = v
+    # 将多值参数转为更友好的单值或列表表示用于日志
+    args_for_log = {k: (v[0] if isinstance(v, list) and len(v) == 1 else v) for k, v in sanitized_args.items()}
+
+    query = urlencode(sanitized_args, doseq=True)
+    sanitized_full_path = request.path + ('?' + query if query else '')
+
     logging.info(
         "INCOMING %s %s %s Headers=%s Args=%s Body=%s",
         request.remote_addr,
         request.method,
-        request.full_path,
+        sanitized_full_path,
         dict(request.headers),
-        args,
+        args_for_log,
         body
     )
 
 
-@app.after_request
-def log_response(response):
-    duration = time.time() - getattr(g, 'start_time', time.time())
-    logging.info(
-        "OUTGOING %s %s -> %s Duration=%.3fs Headers=%s",
-        request.method,
-        request.full_path,
-        response.status_code,
-        duration,
-        dict(response.headers)
-    )
-    return response
+
+# @app.after_request
+# def log_response(response):
+#     duration = time.time() - getattr(g, 'start_time', time.time())
+#     logging.info(
+#         "OUTGOING %s %s -> %s Duration=%.3fs Headers=%s",
+#         request.method,
+#         request.full_path,
+#         response.status_code,
+#         duration,
+#         dict(response.headers)
+#     )
+#     return response
 
 
 def read_yaml_config(file_path):
@@ -81,7 +124,6 @@ def convert(default_config, sub_url):
     subscription_userinfo = ''
     try:
         try:
-            logging.info("Loading YAML from %s" % sub_url)
             # use (connect, read) timeouts so a slow SSL handshake or read won't block forever
             response = requests.get(sub_url, verify=False, timeout=(5, 50))
             response.encoding = 'utf-8'
@@ -89,11 +131,10 @@ def convert(default_config, sub_url):
             content = yaml.safe_load(response.text)
             cache_yaml[sub_url] = content
             cache_yaml[sub_url + 'subscription_userinfo'] = subscription_userinfo
-            logging.info("YAML loaded successfully from %s" % sub_url)
+            logging.info("YAML loaded successfully from sub_url")
         except Exception as e:
-            logging.error("Error loading YAML: %s" % e)
+            logging.error("sub_url Error loading YAML: %s" % e)
             if sub_url in cache_yaml:
-                logging.info("Using cached YAML for %s" % sub_url)
                 content = cache_yaml[sub_url]
                 subscription_userinfo = cache_yaml.get(sub_url + 'subscription_userinfo', '')
                 logging.info("Cached YAML loaded successfully for %s" % sub_url)
@@ -156,13 +197,13 @@ def api():
 
 def get_proxy_ip_port(default_config=None):
     try:
-        logging.info("get_proxy_ip_port")
+        # logging.info("get_proxy_ip_port")
         if default_config is None:
             default_config = read_yaml_config('config.yaml')
         basic_auth = default_config.get('basic_auth')
         url = default_config.get('server_url')
         if basic_auth is None or url is None:
-            logging.info("basic_auth or server_url is None")
+            logging.info("cancel get_proxy_ip_port, basic_auth or url is None")
             return
         headers = {}
         if basic_auth:
@@ -191,5 +232,11 @@ def get_proxy_ip_port(default_config=None):
         pass
 
 
+# python
 if __name__ == '__main__':
-    app.run(host="0.0.0.0", debug=False, port=5000)
+    # 不要和 gevent 一起使用 debug=True，否则会挂起
+    from gevent.pywsgi import WSGIServer
+    # app.debug = False
+    http_server = WSGIServer(('0.0.0.0', 5000), app)
+    http_server.serve_forever()
+
