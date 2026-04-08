@@ -1,13 +1,69 @@
-api_path: /api # 用于获取订阅信息的接口路径，如：/api  请求方式：GET
-password: 12345678 # 请求接口的密码
-sub_url:  # 订阅地址默认忽略
+api_path: /api # 用于clash软件获取订阅信息的接口路径，如：/api  请求方式：GET
+password: 12345678 # clash软件 请求接口的密码
+
+sub_url:  # 机场订阅地址，默认忽略
+
 basic_auth: admin:123456 # 获取代理节点信息：基础认证，格式为 username:password
 server_url:  # 获取代理节点信息,服务地址。默认忽略
 
+exclude_groups: # 订阅时排除的节点名称，默认忽略
+  - 🛑 全球拦截
+  - 🍃 应用净化
+
 #代理信息模板
-proxies: [] # 自己的节点信息
+# 基础设置
+port: 7890          # HTTP代理端口
+socks-port: 7891    # SOCKS5代理端口
+allow-lan: true    # 是否允许局域网访问
+mode: Rule          # 运行模式：Rule(规则)、Global(全局)、Direct(直连)
+log-level: info     # 日志级别
+external-controller: 127.0.0.1:9090
+# 代理节点配置
+proxies:
+  - name: Home
+    type: ss
+    server: 11.11.11.11
+    port: 11
+    cipher: aes-256-gcm
+    password: 1234
+    udp: true
+# 代理组配置
+proxy-groups:
+  - name: 🏠 回家 # 代理组名称
+    type: select # 代理组类型
+    proxies: # 代理组包含的节点
+      - Home
+      - DIRECT # 直连
+  - name: 🤖 Github # 代理组名称
+    type: select # 代理组类型
+    proxies: # 代理组包含的节点
+      - 🚀 节点选择
+      - ♻️ 自动选择
+      - 🎯 全球直连
+  - name: 🚀 节点选择 # 代理组名称
+    type: select # 代理组类型
+    proxies: # 代理组包含的节点
+      - DIRECT
+  - name: ♻️ 自动选择 # 代理组名称
+    type: select # 代理组类型
+    proxies: # 代理组包含的节点
+      - DIRECT
+  - name: 🎯 全球直连 # 代理组名称
+    type: select # 代理组类型
+    proxies: # 代理组包含的节点
+      - DIRECT
+  - name: 🐟 漏网之鱼 # 代理组名称
+    type: select # 代理组类型
+    proxies: # 代理组包含的节点
+      - DIRECT
+# 规则配置
+rules:
+  - DOMAIN-SUFFIX,githubcopilot.com,🤖 Github
+  - DOMAIN-SUFFIX,github.com,🤖 Github
+  - DOMAIN-SUFFIX,githubassets.com,🤖 Github
+  - DOMAIN-SUFFIX,githubusercontent.com,🤖 Github
+  - IP-CIDR,192.168.80.0/24,🏠 回家
+  - DOMAIN-SUFFIX,nx56.top,🏠 回家
+  - MATCH,🐟 漏网之鱼
 
-proxy-groups: [] # 代理组
-
-rules: [] # 规则
 

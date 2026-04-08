@@ -1,4 +1,5 @@
 from gevent import monkey
+
 monkey.patch_all()
 
 import random
@@ -17,6 +18,7 @@ requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 app = Flask(__name__)
 # logger
 import logging
+
 
 def configure_logging(app):
     fmt = '%(asctime)s - %(levelname)s - %(name)s - %(message)s'
@@ -51,13 +53,14 @@ def configure_logging(app):
     werkzeug_logger.setLevel(root_level)
     werkzeug_logger.propagate = False
 
-
     if gunicorn_access.handlers:
         gunicorn_access.handlers = handlers[:]
         gunicorn_access.setLevel(root_level)
         gunicorn_access.propagate = False
 
+
 configure_logging(app)
+
 
 # python
 @app.before_request
@@ -97,7 +100,6 @@ def log_request():
     )
 
 
-
 # @app.after_request
 # def log_response(response):
 #     duration = time.time() - getattr(g, 'start_time', time.time())
@@ -113,71 +115,87 @@ def log_request():
 
 
 def read_yaml_config(file_path):
-    with open(file_path, 'r', encoding='utf-8') as file:
-        return yaml.safe_load(file)
+    try:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            return yaml.safe_load(file)
+    except Exception as e:
+        logging.error("Error reading YAML config: %s" % e)
+        return None
 
 
 cache_yaml = {}
 
 
-def convert(default_config, sub_url):
+def convert(sub_url):
     subscription_userinfo = ''
+    default_config = read_yaml_config('template.yaml')
     try:
-        try:
-            # use (connect, read) timeouts so a slow SSL handshake or read won't block forever
-            response = requests.get(sub_url, verify=False, timeout=(5, 50))
-            response.encoding = 'utf-8'
-            subscription_userinfo = response.headers.get('subscription-userinfo', '')
-            content = yaml.safe_load(response.text)
-            cache_yaml[sub_url] = content
-            cache_yaml[sub_url + 'subscription_userinfo'] = subscription_userinfo
-            logging.info("YAML loaded successfully from sub_url")
-        except Exception as e:
-            logging.error("sub_url Error loading YAML: %s" % e)
-            if sub_url in cache_yaml:
-                content = cache_yaml[sub_url]
-                subscription_userinfo = cache_yaml.get(sub_url + 'subscription_userinfo', '')
-                logging.info("Cached YAML loaded successfully for %s" % sub_url)
-            else:
-                content = read_yaml_config('template.yaml')
-                logging.info("Using local template.yaml as fallback")
-        tmp = OrderedDict()
-        # 合并并去重 proxies
-        for proxy in content['proxies']:
-            tmp[proxy['name']] = proxy
-        for proxy in default_config['proxies']:
-            tmp[proxy['name']] = proxy
-        content['proxies'] = list(tmp.values())
-        # 合并并去重 proxy-groups
-        tmp = OrderedDict()
-        for group in content['proxy-groups']:
-            tmp[group['name']] = group
-        for group in default_config['proxy-groups']:
-            tmp[group['name']] = group
-        content['proxy-groups'] = list(tmp.values())
-        # 合并并去重 rules
-        tmp = []
-        for rule in default_config['rules']:
-            if rule not in tmp:
-                tmp.append(rule)
-        for rule in content['rules']:
-            if rule not in tmp:
-                tmp.append(rule)
-        content['rules'] = tmp
-        default_config = content
+        response = requests.get(sub_url, verify=False, timeout=(5, 50))
+        response.encoding = 'utf-8'
+        subscription_userinfo = response.headers.get('subscription-userinfo', '')
+        remote_config = yaml.safe_load(response.text)
+        cache_yaml[sub_url] = remote_config
+        cache_yaml[sub_url + 'subscription_userinfo'] = subscription_userinfo
+        logging.info("YAML loaded successfully from sub_url")
     except Exception as e:
-        logging.error("Error: %s" % e)
-    if "api_path" in default_config:
-        del default_config['api_path']
-    if 'password' in default_config:
-        del default_config['password']
-    if 'sub_url' in default_config:
-        del default_config['sub_url']
-    if "basic_auth" in default_config:
-        del default_config['basic_auth']
-    if 'server_url' in default_config:
-        del default_config['server_url']
-    return yaml.dump(default_config, allow_unicode=True, sort_keys=False), subscription_userinfo
+        logging.error("sub_url Error loading YAML: %s" % e)
+        if sub_url in cache_yaml:
+            remote_config = cache_yaml[sub_url]
+            subscription_userinfo = cache_yaml.get(sub_url + 'subscription_userinfo', '')
+            logging.info("Cached YAML loaded successfully for %s" % sub_url)
+        else:
+            remote_config = None
+            logging.error("No cached YAML available for %s" % sub_url)
+
+    if remote_config is None and default_config is None:
+        return None, subscription_userinfo
+
+    if remote_config is None:
+        return yaml.dump(default_config, allow_unicode=True, sort_keys=False), subscription_userinfo
+
+    if default_config is None:
+        return yaml.dump(remote_config, allow_unicode=True, sort_keys=False), subscription_userinfo
+
+    tmp = OrderedDict()
+    # 合并并去重 proxies
+    for proxy in remote_config['proxies']:
+        if proxy['name']:
+            tmp[proxy['name']] = proxy
+    for proxy in default_config['proxies']:
+        if proxy['name']:
+            tmp[proxy['name']] = proxy
+    remote_config['proxies'] = list(tmp.values())
+
+    exclude_groups = read_yaml_config('config.yaml')["exclude_groups"]
+    # 合并并去重 proxy-groups
+    tmp = OrderedDict()
+    for group in remote_config['proxy-groups']:
+        if group['name'] not in tmp and group['name'] not in exclude_groups:
+            tmp[group['name']] = group
+    for group in default_config['proxy-groups']:
+        if group['name'] not in tmp and group['name'] not in exclude_groups:
+            tmp[group['name']] = group
+    remote_config['proxy-groups'] = list(tmp.values())
+    # 合并并去重 rules
+    tmp = []
+    for rule in remote_config['rules']:
+        group = rule.split(',')
+        if len(group) >= 3:
+            group = group[2]
+        else:
+            group = group[-1]
+        if rule not in tmp and group not in exclude_groups:
+            tmp.append(rule)
+    for rule in default_config['rules']:
+        group = rule.split(',')
+        if len(group) >= 3:
+            group = group[2]
+        else:
+            group = group[-1]
+        if rule not in tmp and group not in exclude_groups:
+            tmp.insert(0, rule)
+    remote_config['rules'] = tmp
+    return yaml.dump(remote_config, allow_unicode=True, sort_keys=False), subscription_userinfo
 
 
 @app.route(read_yaml_config('config.yaml')['api_path'])
@@ -187,22 +205,25 @@ def api():
     default_config = read_yaml_config('config.yaml')
     if password != str(default_config.get('password', '')):
         return 'Hello World!'
-    get_proxy_ip_port(default_config)
-    yaml, subscription_userinfo = convert(default_config, sub_url if sub_url else default_config.get('sub_url', ''))
+    refresh_proxy_ip_port()
+    if sub_url is None:
+        sub_url = default_config.get('sub_url')
+    clash_yaml, subscription_userinfo = convert(sub_url)
+    if clash_yaml is None:
+        return 'Hello World!'
     headers = {}
     if subscription_userinfo != '':
         headers['subscription-userinfo'] = subscription_userinfo
-    return Response(yaml, mimetype='text/plain', headers=headers)
+    return Response(clash_yaml, mimetype='text/plain', headers=headers)
 
 
-def get_proxy_ip_port(default_config=None):
+def refresh_proxy_ip_port():
+    # 获取最新的代理 IP 和端口，并更新到 config.yaml 中
     try:
-        # logging.info("get_proxy_ip_port")
-        if default_config is None:
-            default_config = read_yaml_config('config.yaml')
+        default_config = read_yaml_config('config.yaml')
         basic_auth = default_config.get('basic_auth')
         url = default_config.get('server_url')
-        if basic_auth is None or url is None:
+        if url is None:
             logging.info("cancel get_proxy_ip_port, basic_auth or url is None")
             return
         headers = {}
@@ -220,11 +241,18 @@ def get_proxy_ip_port(default_config=None):
                 logging.info("ip or port is None")
                 return
             for proxy in default_config['proxies']:
-                proxy['server'] = ip
-                proxy['port'] = int(port)
-            with open('config.yaml', 'w', encoding='utf-8') as file:
+                if "Home" == proxy['name']:
+                    proxy['server'] = ip
+                    proxy['port'] = int(port)
+            default_config.pop('api_path', None)
+            default_config.pop('password', None)
+            default_config.pop('sub_url', None)
+            default_config.pop('basic_auth', None)
+            default_config.pop('server_url', None)
+            default_config.pop('exclude_groups', None)
+            with open('template.yaml', 'w', encoding='utf-8') as file:
                 yaml.dump(default_config, file, allow_unicode=True, sort_keys=False)
-            logging.info("get_proxy_ip_port success")
+            logging.info("refresh_proxy_ip_port success")
         else:
             logging.info(f"Failed to get proxy IP and port. Status code: {response.status_code}")
     except Exception as e:
@@ -234,9 +262,10 @@ def get_proxy_ip_port(default_config=None):
 
 # python
 if __name__ == '__main__':
+    # refresh_proxy_ip_port()
     # 不要和 gevent 一起使用 debug=True，否则会挂起
     from gevent.pywsgi import WSGIServer
+
     # app.debug = False
     http_server = WSGIServer(('0.0.0.0', 5000), app)
     http_server.serve_forever()
-
