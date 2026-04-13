@@ -1,5 +1,5 @@
-Flask
-pyyaml
-requests
-gunicorn
-gevent
+Flask==2.2.5
+PyYAML==6.0
+requests==2.31.0
+gunicorn==20.1.0
+gevent==21.12.0

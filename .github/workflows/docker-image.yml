@@ -1,10 +1,7 @@
 name: Build and Push Docker Image to GitHub Container Registry
 
 on:
-  push:
-    branches:
-      - docker  # 在 `main` 分支 push 时触发
-  pull_request:  # 可选，PR 时也可触发
+  workflow_dispatch:
 
 jobs:
   build:
