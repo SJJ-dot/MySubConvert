@@ -186,6 +186,7 @@ def convert(sub_url):
             group = group[-1]
         if rule not in tmp and group not in exclude_groups:
             tmp.append(rule)
+    idx = 0
     for rule in default_config['rules']:
         group = rule.split(',')
         if len(group) >= 3:
@@ -193,7 +194,8 @@ def convert(sub_url):
         else:
             group = group[-1]
         if rule not in tmp and group not in exclude_groups:
-            tmp.insert(0, rule)
+            tmp.insert(idx, rule)
+            idx += 1
     remote_config['rules'] = tmp
     return yaml.dump(remote_config, allow_unicode=True, sort_keys=False), subscription_userinfo
 
