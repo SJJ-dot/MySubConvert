@@ -2,7 +2,6 @@ from gevent import monkey
 
 monkey.patch_all()
 
-import random
 from collections import OrderedDict
 
 import requests
@@ -130,10 +129,22 @@ def convert(sub_url):
     subscription_userinfo = ''
     default_config = read_yaml_config('template.yaml')
     try:
-        response = requests.get(sub_url, verify=False, timeout=(5, 50))
+        header = {
+            'Accept': '*/*', 'User-Agent': 'clash-verge/v2.4.7'
+        }
+        response = requests.get(sub_url, headers=header, verify=False, timeout=(5, 50))
         response.encoding = 'utf-8'
+        logging.info("GET %s -> %s" % (sub_url, response.status_code))
+        logging.info("Response Headers: %s" % response.headers)
+        logging.info("Response Body: %s" % response.text)
+        if response.status_code != 200:
+            raise ValueError(f"Unexpected status code {response.status_code}")
         subscription_userinfo = response.headers.get('subscription-userinfo', '')
         remote_config = yaml.safe_load(response.text)
+        # Validate that the loaded YAML is the expected mapping/dict
+        if not isinstance(remote_config, dict) or not any(k in remote_config for k in ('proxies', 'proxy-groups', 'rules')):
+            # Raise an explicit error so the outer except block falls back to cache/default
+            raise ValueError('Loaded content is not a valid Clash YAML or is missing required keys')
         cache_yaml[sub_url] = remote_config
         cache_yaml[sub_url + 'subscription_userinfo'] = subscription_userinfo
         logging.info("YAML loaded successfully from sub_url")
