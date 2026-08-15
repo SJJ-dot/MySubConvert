@@ -29,6 +29,7 @@ CONTROL_KEYS = {
     'server_url',                   # 获取 Home 节点最新 IP/端口 的服务地址
     'exclude_groups',               # 合并时排除的代理组 / 规则目标组
     'remove_keys',                  # 从最终配置中移除的顶层 key
+    'merge_groups',                 # 指定代理组合并：sources 组节点并入 target 组
     'cache_ttl',                    # 机场配置缓存时长（秒，0 表示不过期）
 }
 
@@ -227,6 +228,7 @@ def refresh_proxy_ip_port(control):
 def convert(sub_url, control, template):
     exclude = control.get('exclude_groups') or []
     remove_keys = control.get('remove_keys') or []
+    merge_groups = control.get('merge_groups') or []
 
     apply_home_cache(template)
 
@@ -242,6 +244,7 @@ def convert(sub_url, control, template):
         template, remote,
         exclude_groups=exclude,
         remove_keys=remove_keys,
+        merge_groups=merge_groups,
     )
     return yaml.dump(merged, allow_unicode=True, sort_keys=False), userinfo
 

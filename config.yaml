@@ -11,6 +11,13 @@ exclude_groups:         # 合并时排除的「代理组名 / 规则目标组名
 remove_keys:            # 从最终配置中移除的顶层 key（如不想用机场的 dns/tun，取消注释即可）
   # - dns
   # - tun
+merge_groups:           # 指定代理组合并：把 sources 组的「节点」并入 target 组
+  # - target: 🚀 节点选择     # 合并目标组（订阅或本地中存在即可）
+  #   sources:                # 源组：这些组列出的节点会并入 target
+  #     - 国外媒体
+  #     - 电报
+  #   remove_sources: true    # 合并后删除源组（默认 true）
+  #   redirect_rules: true    # 规则中指向源组的自动改指 target（默认 true，防止规则失效）
 cache_ttl: 3600         # 机场配置缓存时长（秒），0 表示不过期（进程内缓存，重启失效）
 
 # ===================== Clash 配置模板（本地配置作为模板） =====================

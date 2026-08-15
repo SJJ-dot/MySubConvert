@@ -139,6 +139,67 @@ def test_full_convert_with_mock(monkeypatch):
     print('[OK] convert 全链路（mock 机场）：合并正确')
 
 
+def test_merge_groups_nodes_merged():
+    template = _load_template()
+    remote = {
+        'proxies': [
+            {'name': 'HK', 'type': 'ss', 'server': '1.1.1.1', 'port': 1},
+            {'name': 'JP', 'type': 'ss', 'server': '2.2.2.2', 'port': 2},
+            {'name': 'US', 'type': 'ss', 'server': '3.3.3.3', 'port': 3},
+        ],
+        'proxy-groups': [
+            {'name': '🚀 节点选择', 'type': 'select', 'proxies': ['HK', 'DIRECT']},
+            {'name': '国外媒体', 'type': 'url-test',
+             'proxies': ['HK', 'JP', 'US'], 'url': 'http://t', 'interval': 300},
+            {'name': '电报', 'type': 'select', 'proxies': ['JP', 'US', 'DIRECT']},
+            {'name': '🐟 漏网之鱼', 'type': 'select', 'proxies': ['🚀 节点选择', 'DIRECT']},
+        ],
+        'rules': [
+            'DOMAIN-SUFFIX,netflix.com,国外媒体',
+            'DOMAIN-SUFFIX,t.me,电报',
+            'MATCH,🐟 漏网之鱼',
+        ],
+    }
+    spec = {'target': '🚀 节点选择', 'sources': ['国外媒体', '电报']}
+    out = merge.merge_configs(template, remote, merge_groups=[spec])
+    groups = {g['name']: g for g in out['proxy-groups']}
+    # 源组节点并入目标组：HK(已有) 去重，新增 JP/US；DIRECT/组名不并入
+    assert groups['🚀 节点选择']['proxies'] == ['HK', 'DIRECT', 'JP', 'US'], groups['🚀 节点选择']
+    # 源组被删除
+    assert '国外媒体' not in groups and '电报' not in groups
+    # 规则自动改指目标组
+    assert 'DOMAIN-SUFFIX,netflix.com,🚀 节点选择' in out['rules']
+    assert 'DOMAIN-SUFFIX,t.me,🚀 节点选择' in out['rules']
+    assert '国外媒体' not in ','.join(out['rules'])
+    print('[OK] merge_groups：节点并入+去重、源组删除、规则改指')
+
+
+def test_merge_groups_keep_sources():
+    template = _load_template()
+    remote = {
+        'proxies': [
+            {'name': 'HK', 'type': 'ss', 'server': '1.1.1.1', 'port': 1},
+            {'name': 'US', 'type': 'ss', 'server': '3.3.3.3', 'port': 3},
+        ],
+        'proxy-groups': [
+            {'name': '🚀 节点选择', 'type': 'select', 'proxies': ['HK']},
+            {'name': '国外媒体', 'type': 'url-test',
+             'proxies': ['HK', 'US'], 'url': 'http://t', 'interval': 300},
+            {'name': '🐟 漏网之鱼', 'type': 'select', 'proxies': ['🚀 节点选择', 'DIRECT']},
+        ],
+        'rules': ['DOMAIN-SUFFIX,netflix.com,国外媒体'],
+    }
+    spec = {'target': '🚀 节点选择', 'sources': ['国外媒体'],
+            'remove_sources': False, 'redirect_rules': False}
+    out = merge.merge_configs(template, remote, merge_groups=[spec])
+    groups = {g['name']: g for g in out['proxy-groups']}
+    # 保留源组：节点并入，但源组与规则均不变
+    assert groups['🚀 节点选择']['proxies'] == ['HK', 'US'], groups['🚀 节点选择']
+    assert '国外媒体' in groups
+    assert 'DOMAIN-SUFFIX,netflix.com,国外媒体' in out['rules']
+    print('[OK] merge_groups：remove_sources=false 时保留源组与规则')
+
+
 if __name__ == '__main__':
     test_top_level_local_override_and_remote_keep()
     test_proxies_merge_subscription_priority()
@@ -148,5 +209,7 @@ if __name__ == '__main__':
     test_rules_local_first()
     test_empty_remote_returns_template()
     test_base64_fallback()
+    test_merge_groups_nodes_merged()
+    test_merge_groups_keep_sources()
     # test_full_convert_with_mock 需要 pytest 的 monkeypatch，单独用 pytest 跑
     print('\n全部基础测试通过 ✅')

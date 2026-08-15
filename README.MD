@@ -18,6 +18,7 @@
 | `proxy-groups` | 按 `name` 合并去重，**订阅同名项优先**（机场完整组覆盖本地 `[DIRECT]` 占位组），本地仅补充自定义组 |
 | 其他顶层 key（`port` / `mode` / `dns` / `tun` / `external-controller` …） | 本地已有则用本地；本地没有且未在 `remove_keys` 中则用订阅的 |
 | `rules` | 本地规则置于最前（Clash 自上而下匹配，本地自定义规则优先级更高），按字符串去重 |
+| 指定组合并（`merge_groups`） | 把 sources 组列出的**节点**去重并入 target 组；默认删除源组，并将指向源组的规则自动改指 target |
 
 > `remove_keys` 从最终配置中移除指定顶层 key（对本地与订阅均生效）。
 > 无订阅（`sub_url` 为空或拉取失败且无缓存）时，直接返回本地模板（含占位标准组兜底）。
@@ -51,6 +52,7 @@
 | `server_url` | 获取 Home 节点最新 IP/端口 的服务地址（可选，为空则不刷新） |
 | `exclude_groups` | 合并时排除的代理组 / 规则目标组名 |
 | `remove_keys` | 从最终配置中移除的顶层 key（如 `dns` / `tun`，对本地与订阅均生效） |
+| `merge_groups` | 指定代理组合并：把 sources 组列出的节点并入 target 组（默认删除源组、规则改指 target，详见「合并规则」） |
 | `cache_ttl` | 机场配置缓存时长（秒），`0` 表示不过期 |
 
 其下为 Clash 配置模板本体（顶层 key、`proxies`、`proxy-groups`、`rules`）。
