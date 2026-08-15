@@ -256,6 +256,31 @@ def test_fetch_remote_fail_no_cache(monkeypatch):
     print('[OK] fetch_remote：失败且无缓存返回 (None, "")')
 
 
+def test_output_key_order_follows_subscription():
+    template = _load_template()
+    remote = {
+        'mixed-port': 7893,
+        'dns': {'enable': True, 'nameserver': ['8.8.8.8']},
+        'port': 8888,
+        'proxies': [{'name': 'HK', 'type': 'ss', 'server': '1.1.1.1', 'port': 1}],
+        'proxy-groups': [{'name': '🚀 节点选择', 'type': 'select', 'proxies': ['HK', 'DIRECT']}],
+        'rules': ['MATCH,🐟 漏网之鱼'],
+    }
+    out = merge.merge_configs(template, remote)
+    keys = list(out.keys())
+    sub_order = ['mixed-port', 'dns', 'port', 'proxies', 'proxy-groups', 'rules']
+    idx = {k: keys.index(k) for k in sub_order}
+    # 订阅配置内部的 key 顺序保持
+    assert [idx[k] for k in sub_order] == sorted(idx.values()), keys
+    # 本地独有 key 全部排在订阅 key 之后
+    local_only = [k for k in keys if k not in set(sub_order)]
+    assert local_only, '应存在本地独有 key'
+    assert max(idx.values()) < min(keys.index(k) for k in local_only), keys
+    # 值语义不变：本地 port 覆盖订阅 8888；订阅独有 mixed-port 保留
+    assert out['port'] == 7890 and out['mixed-port'] == 7893
+    print('[OK] 输出 key 顺序：按订阅配置顺序，本地独有 key 追加末尾')
+
+
 if __name__ == '__main__':
     test_top_level_local_override_and_remote_keep()
     test_proxies_merge_subscription_priority()
@@ -267,6 +292,7 @@ if __name__ == '__main__':
     test_base64_fallback()
     test_merge_groups_nodes_merged()
     test_merge_groups_keep_sources()
+    test_output_key_order_follows_subscription()
     # 以下测试依赖 pytest 的 monkeypatch / requests mock，用 pytest 运行：
     # test_full_convert_with_mock / test_fetch_remote_*
     print('\n全部基础测试通过 ✅')

@@ -158,6 +158,9 @@ def merge_configs(template, remote, exclude_groups=None, remove_keys=None,
                   merge_groups=None):
     """合并本地模板与机场配置，返回合并后的 dict。
 
+    输出顶层 key 顺序：订阅加载成功时按订阅配置的 key 顺序排列
+    （本地同名 key 用本地值覆盖，本地独有 key 追加末尾）；无订阅时按本地模板顺序。
+
     :param template: 本地 Clash 模板（已剔除控制项）
     :param remote: 机场配置 dict，或 None（无订阅时）
     :param exclude_groups: 需排除的代理组 / 规则目标组名
@@ -169,20 +172,23 @@ def merge_configs(template, remote, exclude_groups=None, remove_keys=None,
 
     remove = set(remove_keys or [])
 
-    # 以本地模板为基础
-    result = deepcopy(template)
-    # 移除要求剔除的 key
-    for k in remove:
-        result.pop(k, None)
-
-    # 其他顶层 key：本地已有 -> 用本地；本地没有且未要求移除 -> 用订阅的
+    # 输出 key 顺序：订阅加载成功时按订阅配置的 key 顺序排列
+    # （本地同名 key 用本地值覆盖；本地独有且订阅没有的 key 按本地顺序追加到末尾；
+    #   proxies / proxy-groups / rules 在订阅原位置用合并结果填充）
+    result = {}
     for k, v in remote.items():
-        if k in ('proxies', 'proxy-groups', 'rules'):
-            continue
         if k in remove:
             continue
-        if k not in result:
-            result[k] = deepcopy(v)
+        if k in ('proxies', 'proxy-groups', 'rules'):
+            result[k] = None          # 占位，稍后用合并结果填充，保持订阅中的位置
+        else:
+            result[k] = deepcopy(template.get(k, v))
+
+    # 本地独有、订阅没有且未要求移除的 key，按本地模板顺序追加
+    for k, v in template.items():
+        if k in remove or k in result:
+            continue
+        result[k] = deepcopy(v)
 
     # proxies / proxy-groups：订阅优先（机场同名项优先，本地仅补充新项）
     result['proxies'] = merge_named(
