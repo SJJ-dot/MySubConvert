@@ -1,23 +1,31 @@
-api_path: /api # 用于clash软件获取订阅信息的接口路径，如：/api  请求方式：GET
-password: 12345678 # clash软件 请求接口的密码
-
-sub_url:  # 机场订阅地址，默认忽略
-
-basic_auth: admin:123456 # 获取代理节点信息：基础认证，格式为 username:password
-server_url:  # 获取代理节点信息,服务地址。默认忽略
-
-exclude_groups: # 订阅时排除的节点名称，默认忽略
+# ===================== 服务控制配置 =====================
+# 以下为 subconverter 自身使用的配置，不会出现在输出的 Clash 配置中（合并前自动剥离）。
+api_path: /api          # clash 软件获取订阅的接口路径（修改需重启进程）
+password: 12345678      # 接口访问密码（clash 软件请求时需带上 ?password=xxx）
+sub_url: ""             # 机场订阅链接，可为空；为空时仅返回下方本地模板
+basic_auth: ""          # 动态更新 Home 节点 IP/端口 的基础认证，格式 username:password（可选）
+server_url: ""          # 获取 Home 节点最新 IP/端口 的服务地址（可选，为空则不刷新）
+exclude_groups:         # 合并时排除的「代理组名 / 规则目标组名」
   - 🛑 全球拦截
   - 🍃 应用净化
+remove_keys:            # 从最终配置中移除的顶层 key（如不想用机场的 dns/tun，取消注释即可）
+  # - dns
+  # - tun
+cache_ttl: 3600         # 机场配置缓存时长（秒），0 表示不过期（进程内缓存，重启失效）
 
-#代理信息模板
-# 基础设置
-port: 7890          # HTTP代理端口
-socks-port: 7891    # SOCKS5代理端口
-allow-lan: true    # 是否允许局域网访问
-mode: Rule          # 运行模式：Rule(规则)、Global(全局)、Direct(直连)
-log-level: info     # 日志级别
+# ===================== Clash 配置模板（本地配置作为模板） =====================
+# 下列内容即为 Clash 配置本体。合并策略：
+#   - proxies / proxy-groups：订阅（机场）同名项优先，本地仅补充机场没有的新项；
+#   - 其他顶层 key（port / mode / dns / tun / external-controller ...）：
+#     本地已有则用本地，本地没有且未在 remove_keys 中则用订阅的；
+#   - rules：本地规则置于最前（优先级更高）。
+port: 7890              # HTTP 代理端口
+socks-port: 7891        # SOCKS5 代理端口
+allow-lan: true         # 是否允许局域网访问
+mode: Rule              # 运行模式：Rule(规则) / Global(全局) / Direct(直连)
+log-level: info         # 日志级别
 external-controller: 127.0.0.1:9090
+
 # 代理节点配置
 proxies:
   - name: Home
@@ -27,36 +35,38 @@ proxies:
     cipher: aes-256-gcm
     password: 1234
     udp: true
+
 # 代理组配置
 proxy-groups:
-  - name: 🏠 回家 # 代理组名称
-    type: select # 代理组类型
-    proxies: # 代理组包含的节点
+  - name: 🏠 回家          # 自定义组：回家走 Home 节点
+    type: select
+    proxies:
       - Home
-      - DIRECT # 直连
-  - name: 🤖 Github # 代理组名称
-    type: select # 代理组类型
-    proxies: # 代理组包含的节点
+      - DIRECT
+  - name: 🤖 Github        # 自定义组：GitHub 走机场
+    type: select
+    proxies:
       - 🚀 节点选择
       - ♻️ 自动选择
       - 🎯 全球直连
-  - name: 🚀 节点选择 # 代理组名称
-    type: select # 代理组类型
-    proxies: # 代理组包含的节点
+  - name: 🚀 节点选择       # 标准组（占位）：有订阅时被机场完整组覆盖，无订阅时兜底
+    type: select
+    proxies:
       - DIRECT
-  - name: ♻️ 自动选择 # 代理组名称
-    type: select # 代理组类型
-    proxies: # 代理组包含的节点
+  - name: ♻️ 自动选择       # 标准组（占位）
+    type: select
+    proxies:
       - DIRECT
-  - name: 🎯 全球直连 # 代理组名称
-    type: select # 代理组类型
-    proxies: # 代理组包含的节点
+  - name: 🎯 全球直连       # 标准组（占位）
+    type: select
+    proxies:
       - DIRECT
-  - name: 🐟 漏网之鱼 # 代理组名称
-    type: select # 代理组类型
-    proxies: # 代理组包含的节点
+  - name: 🐟 漏网之鱼       # 标准组（占位）
+    type: select
+    proxies:
       - DIRECT
-# 规则配置
+
+# 规则配置（本地规则在前，优先级更高）
 rules:
   - DOMAIN-SUFFIX,githubcopilot.com,🤖 Github
   - DOMAIN-SUFFIX,github.com,🤖 Github
@@ -65,5 +75,3 @@ rules:
   - IP-CIDR,192.168.80.0/24,🏠 回家
   - DOMAIN-SUFFIX,nx56.top,🏠 回家
   - MATCH,🐟 漏网之鱼
-
-
