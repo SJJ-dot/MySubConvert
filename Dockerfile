@@ -26,4 +26,6 @@ EXPOSE 5000
 
 # 定义运行 Flask 应用程序的命令
 # 使用 gevent worker 以支持异步 IO（requests 在 gevent.patch_all 后会被协作调度）
-CMD ["gunicorn", "-k", "gevent", "-w", "4", "-b", "0.0.0.0:5000", "--timeout", "120", "--log-level", "info", "--error-logfile", "-", "--access-logfile", "-", "main:app"]
+# 单用户场景：1 个 worker 足够（gevent 协程即可并发处理订阅请求）；
+# 若多人高并发使用，可将 -w 1 调回 -w 4
+CMD ["gunicorn", "-k", "gevent", "-w", "1", "-b", "0.0.0.0:5000", "--timeout", "120", "--log-level", "info", "--error-logfile", "-", "--access-logfile", "-", "main:app"]
