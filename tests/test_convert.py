@@ -1,7 +1,8 @@
 """合并逻辑测试：覆盖本地优先、列表去重、代理组机场优先、rules 顺序、
-exclude_groups、remove_keys、空 sub_url 等场景。"""
+exclude_groups、remove_keys、空 sub_url、merge_groups、fetch_remote 真实路径等场景。"""
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -200,6 +201,61 @@ def test_merge_groups_keep_sources():
     print('[OK] merge_groups：remove_sources=false 时保留源组与规则')
 
 
+class _FakeResp:
+    """模拟 requests.Response 的最小对象。"""
+    def __init__(self, status_code, text, headers=None):
+        self.status_code = status_code
+        self.text = text
+        self.headers = headers or {}
+
+
+def test_fetch_remote_success(monkeypatch):
+    payload = yaml.safe_dump(
+        {'port': 7890, 'proxies': [{'name': 'A', 'type': 'ss', 'server': '1.1.1.1', 'port': 1}]},
+        allow_unicode=True)
+    monkeypatch.setattr(
+        main.requests, 'get',
+        lambda *a, **k: _FakeResp(200, payload, {'subscription-userinfo': 'upload=1'}))
+    main.remote_cache.clear()
+    data, ui = main.fetch_remote('http://fake', ttl=0)
+    assert data['port'] == 7890 and data['proxies'][0]['name'] == 'A'
+    assert ui == 'upload=1'
+    assert 'http://fake' in main.remote_cache          # 已写入缓存
+    print('[OK] fetch_remote：拉取成功、解析并缓存')
+
+
+def test_fetch_remote_cache_hit(monkeypatch):
+    main.remote_cache['http://fake'] = {
+        'ts': time.time(), 'data': {'proxies': []}, 'userinfo': 'cached'}
+    # 命中缓存时不应发起网络请求
+    def _no_call(*a, **k):
+        raise AssertionError('命中缓存不应发起 requests.get')
+    monkeypatch.setattr(main.requests, 'get', _no_call)
+    data, ui = main.fetch_remote('http://fake', ttl=0)
+    assert data == {'proxies': []} and ui == 'cached'
+    print('[OK] fetch_remote：缓存命中（ttl=0 不过期）不发请求')
+
+
+def test_fetch_remote_fallback_cache(monkeypatch):
+    main.remote_cache['http://fake'] = {
+        'ts': 0, 'data': {'proxies': []}, 'userinfo': 'cached'}
+    # 缓存过期（ts=0 且 ttl>0）→ 发起请求 → 失败 → 回退缓存
+    monkeypatch.setattr(main.requests, 'get',
+                        lambda *a, **k: (_ for _ in ()).throw(Exception('network down')))
+    data, ui = main.fetch_remote('http://fake', ttl=3600)
+    assert data == {'proxies': []} and ui == 'cached'
+    print('[OK] fetch_remote：拉取失败回退缓存')
+
+
+def test_fetch_remote_fail_no_cache(monkeypatch):
+    main.remote_cache.clear()
+    monkeypatch.setattr(main.requests, 'get',
+                        lambda *a, **k: (_ for _ in ()).throw(Exception('network down')))
+    data, ui = main.fetch_remote('http://fake', ttl=0)
+    assert data is None and ui == ''
+    print('[OK] fetch_remote：失败且无缓存返回 (None, "")')
+
+
 if __name__ == '__main__':
     test_top_level_local_override_and_remote_keep()
     test_proxies_merge_subscription_priority()
@@ -211,5 +267,6 @@ if __name__ == '__main__':
     test_base64_fallback()
     test_merge_groups_nodes_merged()
     test_merge_groups_keep_sources()
-    # test_full_convert_with_mock 需要 pytest 的 monkeypatch，单独用 pytest 跑
+    # 以下测试依赖 pytest 的 monkeypatch / requests mock，用 pytest 运行：
+    # test_full_convert_with_mock / test_fetch_remote_*
     print('\n全部基础测试通过 ✅')

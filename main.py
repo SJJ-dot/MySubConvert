@@ -6,6 +6,7 @@ import base64
 import logging
 import os
 import time
+from copy import deepcopy
 
 import requests
 import yaml
