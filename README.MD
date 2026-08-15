@@ -23,6 +23,44 @@
 > `remove_keys` 从最终配置中移除指定顶层 key（对本地与订阅均生效）。
 > 无订阅（`sub_url` 为空或拉取失败且无缓存）时，直接返回本地模板（含占位标准组兜底）。
 
+### merge_groups：把指定代理组合并到目标组
+
+将订阅源中若干个代理组（如「国外媒体」「电报」）列出的**节点**去重并入目标组（如「🚀 节点选择」），适合把多组重复节点收敛到一个组、精简订阅。
+
+配置格式（位于 `config.yaml` 控制项区，可配置多条）：
+
+```yaml
+merge_groups:                  # 支持多条合并规则
+  - target: 🚀 节点选择        # 合并目标组（订阅或本地中存在即可）
+    sources:                  # 源组列表：这些组列出的节点会并入 target
+      - 国外媒体
+      - 电报
+    remove_sources: true      # 合并后删除源组（默认 true）
+    redirect_rules: true      # 规则中指向源组的自动改指 target（默认 true，防规则失效）
+  # - target: 其他目标组        # 第二条合并规则示例
+  #   sources:
+  #     - 组A
+  #     - 组B
+```
+
+合并行为说明：
+
+- 只并入**真正的节点**（出现在 `proxies` 列表中的名字）；`DIRECT` / `REJECT` 等内置策略、代理组名、目标组自身均不会并入，避免产生循环引用；
+- 并入节点自动去重（目标组已有的成员不会重复添加）；
+- `remove_sources: true`（默认）：合并后从输出中删除源组，并把规则中指向源组的条目自动改指 `target`，防止规则指向不存在的组；
+- `remove_sources: false`：保留源组，规则不做改写；
+- 订阅中不存在的源组或目标组会被跳过，不影响其余配置。
+
+示例效果（合并前 → 合并后）：
+
+| 代理组 | 合并前 | 合并后 |
+| --- | --- | --- |
+| `国外媒体`（url-test） | HK, JP, US | （已删除） |
+| `电报`（select） | JP, US, DIRECT | （已删除） |
+| `🚀 节点选择` | HK, DIRECT | HK, DIRECT, JP, US |
+
+同时规则改写：`DOMAIN-SUFFIX,netflix.com,国外媒体` → `DOMAIN-SUFFIX,netflix.com,🚀 节点选择`，`DOMAIN-SUFFIX,t.me,电报` → `DOMAIN-SUFFIX,t.me,🚀 节点选择`。
+
 ## 接口说明
 
 ### 1. 获取订阅
