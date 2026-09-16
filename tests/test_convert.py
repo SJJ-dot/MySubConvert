@@ -367,6 +367,69 @@ def test_convert_fetch_fail_falls_back_to_cache(monkeypatch):
     print('[OK] convert：拉取失败回退缓存 → 仍走合并')
 
 
+def test_resolve_sub_url_by_index():
+    """多订阅地址：?sub_url=N 选择 sub_urlN，未传/为空/越界回退 sub_url。"""
+    control = {'sub_url': 'https://default',
+               'sub_url1': 'https://one',
+               'sub_url3': 'https://three'}
+    # 未传 / 空串 → 默认
+    assert main.resolve_sub_url(None, control) == 'https://default'
+    assert main.resolve_sub_url('', control) == 'https://default'
+    # 序号选择（允许首尾空白）
+    assert main.resolve_sub_url('1', control) == 'https://one'
+    assert main.resolve_sub_url('3', control) == 'https://three'
+    assert main.resolve_sub_url(' 1 ', control) == 'https://one'
+    # sub_urlN 未配置 → 回退默认
+    assert main.resolve_sub_url('2', control) == 'https://default'
+    # 越界 → 回退默认
+    assert main.resolve_sub_url('0', control) == 'https://default'
+    assert main.resolve_sub_url('9', control) == 'https://default'
+    # 直接传完整地址 → 原样使用（兼容旧用法）
+    assert main.resolve_sub_url('https://raw.example/sub', control) == 'https://raw.example/sub'
+    # 默认也为空 → 空串（走最小配置）
+    assert main.resolve_sub_url('3', {}) == ''
+    print('[OK] resolve_sub_url：序号选择 / 回退 / 直传地址')
+
+
+def test_sub_url_keys_are_control_keys():
+    """sub_url 与 sub_url1~5 都是控制项，不得泄漏进输出的 Clash 配置。"""
+    assert main.SUB_URL_KEYS == ['sub_url', 'sub_url1', 'sub_url2', 'sub_url3',
+                                 'sub_url4', 'sub_url5'], main.SUB_URL_KEYS
+    for k in main.SUB_URL_KEYS:
+        assert k in main.CONTROL_KEYS, k
+    _, template = main.load_local_config()
+    leaked = [k for k in main.SUB_URL_KEYS if k in template]
+    assert not leaked, leaked
+    print('[OK] 控制项：sub_url1~5 已从模板中剥离')
+
+
+def test_api_selects_subscription_by_index(monkeypatch):
+    """api() 集成：请求 ?sub_url=N 时把对应地址交给 convert()。"""
+    control = {'password': 'pw', 'sub_url': 'http://default',
+               'sub_url2': 'http://two', 'cache_ttl': 0}
+    template = _load_template()
+    monkeypatch.setattr(main, 'load_local_config', lambda *a, **k: (control, template))
+    seen = []
+
+    def _fake_convert(url, c, t):
+        seen.append(url)
+        return 'proxies: []', ''
+
+    monkeypatch.setattr(main, 'convert', _fake_convert)
+    client = main.app.test_client()
+
+    assert client.get(main.API_PATH, query_string={'password': 'pw'}).status_code == 200
+    client.get(main.API_PATH, query_string={'password': 'pw', 'sub_url': '2'})
+    client.get(main.API_PATH, query_string={'password': 'pw', 'sub_url': '5'})
+    client.get(main.API_PATH, query_string={'password': 'pw', 'sub_url': 'http://direct'})
+    assert seen == ['http://default', 'http://two', 'http://default', 'http://direct'], seen
+    # 密码错误时不进入转换
+    assert client.get(main.API_PATH, query_string={'password': 'bad'}).get_data(as_text=True) \
+        == 'Hello World!'
+    assert len(seen) == 4
+    print('[OK] api：按 ?sub_url=N 选择订阅地址（未配置则回退默认）')
+
+
 if __name__ == '__main__':
     test_top_level_local_override_and_remote_keep()
     test_proxies_merge_subscription_priority()
@@ -381,6 +444,8 @@ if __name__ == '__main__':
     test_output_key_order_follows_subscription()
     test_build_minimal_config_is_local_only()
     test_convert_no_sub_url_returns_minimal_config()
+    test_resolve_sub_url_by_index()
+    test_sub_url_keys_are_control_keys()
     # 以下测试依赖 pytest 的 monkeypatch / requests mock，用 pytest 运行：
     # test_full_convert_with_mock / test_fetch_remote_*
     print('\n全部基础测试通过 ✅')

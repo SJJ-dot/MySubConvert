@@ -2,7 +2,12 @@
 # 以下为 subconverter 自身使用的配置，不会出现在输出的 Clash 配置中（合并前自动剥离）。
 api_path: /api          # clash 软件获取订阅的接口路径（修改需重启进程）
 password: 12345678      # 接口访问密码（clash 软件请求时需带上 ?password=xxx）
-sub_url: ""             # 机场订阅链接，可为空；为空时根据下方本地配置生成最小配置文件
+sub_url: ""             # 默认机场订阅链接，可为空；为空时根据下方本地配置生成最小配置文件
+sub_url1: ""            # 备用订阅 1：客户端请求 ?sub_url=1 时使用（为空则回退 sub_url）
+sub_url2: ""            # 备用订阅 2：?sub_url=2
+sub_url3: ""            # 备用订阅 3：?sub_url=3
+sub_url4: ""            # 备用订阅 4：?sub_url=4
+sub_url5: ""            # 备用订阅 5：?sub_url=5
 basic_auth: ""          # 动态更新 Home 节点 IP/端口 的基础认证，格式 username:password（可选）
 server_url: ""          # 获取 Home 节点最新 IP/端口 的服务地址（可选，为空则不刷新）
 exclude_groups:         # 合并时排除的「代理组名 / 规则目标组名」

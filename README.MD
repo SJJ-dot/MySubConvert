@@ -82,7 +82,22 @@ merge_groups:                  # 支持多条合并规则
 - 路径：`/api`（与 `config.yaml` 的 `api_path` 一致，修改需重启）
 - 参数：
   - `password`：与 `config.yaml` 的 `password` 一致（必填，错误返回 `Hello World!`）
-  - `sub_url`：可选，覆盖配置中的 `sub_url`
+  - `sub_url`：可选，选择用哪个订阅地址。规则见下方「多订阅地址」
+
+#### 多订阅地址
+
+`config.yaml` 中可配置 `sub_url`（默认）与 `sub_url1` ~ `sub_url5`（备用），通过请求参数选择：
+
+| 请求 | 使用的地址 |
+| --- | --- |
+| 不传 `sub_url` | `sub_url` |
+| `?sub_url=1` | `sub_url1` |
+| `?sub_url=2` … `?sub_url=5` | `sub_url2` … `sub_url5` |
+| `?sub_url=https://...` | 直接使用该地址（兼容旧用法） |
+| `?sub_url=9`（超出 1~5） | 忽略，使用 `sub_url` |
+| `?sub_url=N` 但 `sub_urlN` 为空 | 回退 `sub_url` |
+
+各个地址**独立缓存**（缓存的 key 是最终解析出的完整地址），因此可以在客户端建多个订阅配置分别指向不同机场，互不影响。选择与回退过程会打印 `按请求选择订阅地址` / `sub_urlN 未配置，回退默认 sub_url` 等日志。
 
 成功返回 `text/plain` 的 Clash 配置；若机场返回 `subscription-userinfo`，会原样透传该响应头。
 
@@ -100,7 +115,8 @@ merge_groups:                  # 支持多条合并规则
 | --- | --- |
 | `api_path` | 订阅接口路径，默认 `/api` |
 | `password` | 接口访问密码 |
-| `sub_url` | 机场订阅链接，可为空 |
+| `sub_url` | 默认机场订阅链接，可为空 |
+| `sub_url1` ~ `sub_url5` | 备用订阅链接，客户端请求 `?sub_url=N` 时使用；为空则回退 `sub_url`（详见「多订阅地址」） |
 | `basic_auth` | 动态刷新 Home IP 的基础认证 `username:password`（可选） |
 | `server_url` | 获取 Home 节点最新 IP/端口 的服务地址（可选，为空则不刷新） |
 | `exclude_groups` | 合并时排除的代理组 / 规则目标组名 |
@@ -119,7 +135,12 @@ merge_groups:                  # 支持多条合并规则
 # ===================== 服务控制配置 =====================
 api_path: /api            # 订阅接口路径（修改需重启进程）
 password: change-me       # 接口访问密码，务必改成强密码
-sub_url: ""               # 机场订阅链接，可为空；为空时根据下方本地配置生成最小配置文件
+sub_url: ""               # 默认机场订阅链接，可为空；为空时根据下方本地配置生成最小配置文件
+sub_url1: ""              # 备用订阅 1：客户端请求 ?sub_url=1 时使用（为空则回退 sub_url）
+sub_url2: ""              # 备用订阅 2：?sub_url=2
+sub_url3: ""              # 备用订阅 3：?sub_url=3
+sub_url4: ""              # 备用订阅 4：?sub_url=4
+sub_url5: ""              # 备用订阅 5：?sub_url=5
 basic_auth: ""            # 动态刷新 Home 节点 IP/端口 的基础认证 username:password（可选）
 server_url: ""            # 获取 Home 节点最新 IP/端口 的服务地址（可选，为空则不刷新）
 exclude_groups:           # 合并时排除的「代理组名 / 规则目标组名」

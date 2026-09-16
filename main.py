@@ -30,18 +30,22 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, 'config.yaml')
 HOME_CACHE_FILE = os.path.join(BASE_DIR, 'home_cache.yaml')
 
+# 订阅地址：config.yaml 可配置 sub_url（默认）与 sub_url1 ~ sub_url5（备用）。
+# 请求 ?sub_url=N（1~5）选择第 N 个，未传或回退时使用 sub_url。
+SUB_URL_COUNT = 5
+SUB_URL_KEYS = ['sub_url'] + ['sub_url%d' % i for i in range(1, SUB_URL_COUNT + 1)]
+
 # 控制配置项（不会出现在输出的 Clash 配置中，合并前会被剥离）
 CONTROL_KEYS = {
     'api_path',                     # 订阅接口路径（修改需重启）
     'password',                     # 接口访问密码
-    'sub_url',                      # 机场订阅链接（可空）
     'basic_auth',                   # 动态更新 Home 节点 IP/端口 的基础认证 username:password
     'server_url',                   # 获取 Home 节点最新 IP/端口 的服务地址
     'exclude_groups',               # 合并时排除的代理组 / 规则目标组
     'remove_keys',                  # 从最终配置中移除的顶层 key
     'merge_groups',                 # 指定代理组合并：sources 组节点并入 target 组
     'cache_ttl',                    # 机场配置缓存时长（秒，0 表示不过期）
-}
+} | set(SUB_URL_KEYS)               # sub_url / sub_url1 ~ sub_url5
 
 app = Flask(__name__)
 
@@ -133,6 +137,33 @@ def load_local_config(path=CONFIG_FILE):
     control = {k: raw.get(k) for k in CONTROL_KEYS if k in raw}
     template = {k: v for k, v in raw.items() if k not in CONTROL_KEYS}
     return control, template
+
+
+def resolve_sub_url(requested, control):
+    """把请求参数 sub_url 解析为真实订阅地址。
+
+    - `?sub_url=N`（1~5）：取 config.yaml 中的 sub_urlN；该项为空时回退 sub_url；
+    - 传入完整地址（含非数字）：直接使用，兼容旧用法；
+    - 数字超出 1~5 或未传：使用 sub_url。
+    """
+    requested = str(requested or '').strip()
+    if not requested:
+        return control.get('sub_url') or ''
+
+    if requested.isdigit():
+        idx = int(requested)
+        if 1 <= idx <= SUB_URL_COUNT:
+            url = control.get('sub_url%d' % idx) or ''
+            if url:
+                logging.info("按请求选择订阅地址: sub_url=%s -> sub_url%d", requested, idx)
+                return url
+            logging.info("sub_url%d 未配置，回退默认 sub_url", idx)
+            return control.get('sub_url') or ''
+        logging.info("请求的 sub_url=%s 超出 1~%d 范围，使用默认 sub_url",
+                     requested, SUB_URL_COUNT)
+        return control.get('sub_url') or ''
+
+    return requested
 
 
 # ===================== 订阅获取：第 1 步拉取 → 第 2 步回退缓存 → 第 3 步最小配置 =====================
@@ -315,7 +346,7 @@ def api():
 
     refresh_proxy_ip_port(control)
 
-    sub_url = request.args.get('sub_url') or control.get('sub_url') or ''
+    sub_url = resolve_sub_url(request.args.get('sub_url'), control)
     clash_yaml, userinfo = convert(sub_url, control, template)
     if clash_yaml is None:
         return 'Hello World!'
