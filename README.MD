@@ -1,6 +1,10 @@
 ### 订阅转换服务（subconverter）
 
-拉取机场 Clash 订阅，以**本地配置为模板**、**节点与代理组订阅优先**的原则合并，返回最终 Clash 配置。
+拉取机场 Clash 订阅，以**本地配置为唯一的配置来源**合并，返回最终 Clash 配置。
+
+> 机场只贡献**代理节点**。除此之外的一切（代理组、规则、`dns`、端口、客户端行为……）
+> **只使用本地配置**，机场的对应内容一律丢弃——不同机场的配置结构与规则集差异极大，
+> 统一由本地决定后，换机场只影响节点列表，客户端里的行为完全不变。
 
 ## 请求处理流程
 
@@ -11,68 +15,69 @@
 | ① 拉取 | 有 `sub_url` | 每次请求都**实时拉取**机场订阅（网络优先） |
 | ② 回退缓存 | ① 失败，且存在 `cache_ttl` 有效期内的缓存 | 使用内存缓存里的节点配置 |
 | ③ 生成最小配置 | ① 失败，且缓存未命中（超期或从未拉取过）；或 `sub_url` 为空 | 根据本地配置生成最小配置文件（仅本地节点 + 本地代理组 / 规则） |
-| ④ 转换 | 总是执行 | 按本地配置转换订阅文件：补充本地节点、修正代理规则与代理组 |
+| ④ 转换 | 总是执行 | 除代理节点外全部取本地配置；把机场节点插入 `"*"` 表达式位置 |
 
 > ①②③ 的产物都是第 ④ 步的输入，第 ④ 步始终执行，保证任一分支下输出都是完整可用的 Clash 配置。
 
 ## 核心特性
 
-- `config.yaml` 既是服务配置文件，也是 Clash 配置模板。
-- 与 Clash 配置无关的控制项（密码、订阅链接、排除组等）在合并前自动剥离，不会泄漏到输出。
+- `config.yaml` 既是服务配置文件，也是 Clash 配置本体。
+- **除代理节点外只使用本地配置**：机场的 `proxy-groups` / `rules` / `dns` / 端口 / 客户端行为等一律不参与输出。换机场不会改变客户端的任何行为，只有节点列表变。
+- 与 Clash 配置无关的控制项（密码、订阅链接等）在合并前自动剥离，不会泄漏到输出。
 - 机场「节点配置」**每次请求都实时拉取**（网络优先）；拉取失败才回退内存缓存（有效期由 `cache_ttl` 控制，超期视同未命中）。流量用量（`subscription-userinfo`）来自当次拉取，因此始终最新。
 - Home 节点 IP/端口支持通过 `server_url` 动态刷新（持久化到 `home_cache.yaml`），每次请求都刷新，不参与上述缓存。
 
-## 合并规则（本地配置作为模板，节点与代理组以订阅优先）
+## 转换规则（本地配置为准）
 
 | 内容 | 策略 |
 | --- | --- |
-| `proxies` | 按 `name` 合并去重，**订阅（机场）同名项优先**，本地仅补充机场没有的新项 |
-| `proxy-groups` | 按 `name` 合并去重，**订阅同名项优先**（机场完整组覆盖本地 `[DIRECT]` 占位组），本地仅补充自定义组 |
-| 其他顶层 key（`port` / `mode` / `dns` / `tun` / `external-controller` …） | 本地已有则用本地；本地没有且未在 `remove_keys` 中则用订阅的 |
-| `rules` | 本地规则置于最前（Clash 自上而下匹配，本地自定义规则优先级更高），按字符串去重 |
-| 指定组合并（`merge_groups`） | 把 sources 组列出的**节点**去重并入 target 组；默认删除源组，并将指向源组的规则自动改指 target |
-| 顶层 key 顺序 | 订阅加载成功时按**订阅配置的 key 顺序**输出（本地同名覆盖值，本地独有 key 追加末尾）；无订阅时按本地模板顺序 |
+| 顶层 key 与顺序 | **完全按本地配置**：机场的顶层 key 一个都不会进入输出 |
+| `proxy-groups` | **只使用本地配置**，机场的代理组整体丢弃（同名组也不会被机场覆盖） |
+| `rules` | **只使用本地配置**，机场的规则整体丢弃 |
+| `proxies` | 本地节点 + 机场节点，按 `name` 去重，**本地同名优先**；机场节点插入 `"*"` 表达式所在位置，未使用表达式时追加到末尾 |
 
-> `remove_keys` 从最终配置中移除指定顶层 key（对本地与订阅均生效）。
-> 无订阅（`sub_url` 为空，或拉取失败且缓存未命中）时，第 ③ 步生成的最小配置文件就是本地模板本身（含占位标准组兜底），再经第 ④ 步合并输出。
+> 本地配置里没有的项，输出里也不会有（不会从机场「继承」）。原先依赖机场提供的 `dns`、
+> `unified-delay` 等，现在需要在本文件里显式声明——`config.yaml` 已给出可直接用的写法。
 
-### merge_groups：把指定代理组合并到目标组
+### 表达式 `"*"`：插入机场节点
 
-将订阅源中若干个代理组（如「国外媒体」「电报」）列出的**节点**去重并入目标组（如「🚀 节点选择」），适合把多组重复节点收敛到一个组、精简订阅。
-
-配置格式（位于 `config.yaml` 控制项区，可配置多条）：
+写在代理组的 `proxies` 列表（或顶层 `proxies` 列表）中，代表「此处插入机场带来的全部节点」：
 
 ```yaml
-merge_groups:                  # 支持多条合并规则
-  - target: 🚀 节点选择        # 合并目标组（订阅或本地中存在即可）
-    sources:                  # 源组列表：这些组列出的节点会并入 target
-      - 国外媒体
-      - 电报
-    remove_sources: true      # 合并后删除源组（默认 true）
-    redirect_rules: true      # 规则中指向源组的自动改指 target（默认 true，防规则失效）
-  # - target: 其他目标组        # 第二条合并规则示例
-  #   sources:
-  #     - 组A
-  #     - 组B
+proxy-groups:
+  - name: 🚀 节点选择
+    type: select
+    proxies:
+      - ♻️ 自动选择
+      - "*"                    # ← 展开为机场的全部节点
+      - DIRECT
+  - name: ♻️ 自动选择
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    proxies:
+      - "*"                    # ← 同样展开为机场的全部节点
 ```
 
-合并行为说明：
+> ⚠️ YAML 中**必须加引号**写作 `- "*"`。裸写 `- *` 是 YAML 的别名（alias）语法，
+> 解析会直接失败（日志报 `while scanning an alias`），此时接口返回 `Hello World!`。
 
-- 只并入**真正的节点**（出现在 `proxies` 列表中的名字）；`DIRECT` / `REJECT` 等内置策略、代理组名、目标组自身均不会并入，避免产生循环引用；
-- 并入节点自动去重（目标组已有的成员不会重复添加）；
-- `remove_sources: true`（默认）：合并后从输出中删除源组，并把规则中指向源组的条目自动改指 `target`，防止规则指向不存在的组；
-- `remove_sources: false`：保留源组，规则不做改写；
-- 订阅中不存在的源组或目标组会被跳过，不影响其余配置。
+行为说明：
 
-示例效果（合并前 → 合并后）：
+- 展开的是**机场带来的节点**：与本地模板同名的节点不算（本地定义优先），因此不会重复插入；
+- 表达式在输出前一定被展开，不会残留到最终配置里；
+- 同一组内自动去重，保留成员首次出现的位置；
+- **组内只有一个表达式且没有机场节点时**，该组会兜底为 `DIRECT`（Clash 要求代理组至少有一个成员），
+  避免机场不可用时输出非法配置；
+- 本地配置里**完全没有**这个表达式时，机场节点仍会进入顶层 `proxies`，
+  但不会被任何代理组引用（日志会给出 `本地配置未使用 * 表达式` 警告）。
 
-| 代理组 | 合并前 | 合并后 |
-| --- | --- | --- |
-| `国外媒体`（url-test） | HK, JP, US | （已删除） |
-| `电报`（select） | JP, US, DIRECT | （已删除） |
-| `🚀 节点选择` | HK, DIRECT | HK, DIRECT, JP, US |
+> 想从输出中临时去掉某个顶层 key，直接注释掉配置文件里对应的那段即可。
+> 无机场节点（`sub_url` 为空，或拉取失败且缓存未命中）时，第 ③ 步生成的最小配置文件就是本地模板本身，
+> 表达式展开为空、组内兜底 `DIRECT`，再经第 ④ 步输出。
 
-同时规则改写：`DOMAIN-SUFFIX,netflix.com,国外媒体` → `DOMAIN-SUFFIX,netflix.com,🚀 节点选择`，`DOMAIN-SUFFIX,t.me,电报` → `DOMAIN-SUFFIX,t.me,🚀 节点选择`。
+> 输出前有两项自证日志（仅在异常时出现）：`规则的目标不存在`（规则指向未定义的组或节点）、
+> `代理组成员不存在`（组里写了不存在的节点名，含旧版表达式 `__REMOTE_PROXIES__` 的残留）。
 
 ## 接口说明
 
@@ -119,12 +124,14 @@ merge_groups:                  # 支持多条合并规则
 | `sub_url1` ~ `sub_url5` | 备用订阅链接，客户端请求 `?sub_url=N` 时使用；为空则回退 `sub_url`（详见「多订阅地址」） |
 | `basic_auth` | 动态刷新 Home IP 的基础认证 `username:password`（可选） |
 | `server_url` | 获取 Home 节点最新 IP/端口 的服务地址（可选，为空则不刷新） |
-| `exclude_groups` | 合并时排除的代理组 / 规则目标组名 |
-| `remove_keys` | 从最终配置中移除的顶层 key（如 `dns` / `tun`，对本地与订阅均生效） |
-| `merge_groups` | 指定代理组合并：把 sources 组列出的节点并入 target 组（默认删除源组、规则改指 target，详见「合并规则」） |
 | `cache_ttl` | 拉取失败时用于回退的缓存有效期（秒），`0` 表示永不过期。机场配置每次请求都会实时拉取，缓存仅作失败回退 |
 
-其下为 Clash 配置模板本体（顶层 key、`proxies`、`proxy-groups`、`rules`）。
+> `remove_keys` / `exclude_groups` / `merge_groups` 已**废弃**：输出的顶层 key、代理组与规则现在全部只取本地配置，
+> 无需再移除或排除任何内容（想临时去掉某个 key，直接注释掉配置文件里对应的那段）。
+> 配置里若还留着这几项，不会生效（但会被当作控制项剥离，不会泄漏到输出配置中），可自行删除。
+
+其下为 Clash 配置本体（顶层 key、`proxies`、`proxy-groups`、`rules`）。除代理节点外，
+输出内容全部取自这里，所以要改客户端行为直接改本文件即可。
 
 ## 配置文件示例（config.yaml）
 
@@ -143,17 +150,20 @@ sub_url4: ""              # 备用订阅 4：?sub_url=4
 sub_url5: ""              # 备用订阅 5：?sub_url=5
 basic_auth: ""            # 动态刷新 Home 节点 IP/端口 的基础认证 username:password（可选）
 server_url: ""            # 获取 Home 节点最新 IP/端口 的服务地址（可选，为空则不刷新）
-exclude_groups:           # 合并时排除的「代理组名 / 规则目标组名」
-  - 🛑 全球拦截
-remove_keys:              # 从最终配置中移除的顶层 key（取消注释即生效）
-  # - dns
-  # - tun
 cache_ttl: 0           # 拉取失败时回退缓存的有效期（秒），0 表示永不过期
 
 # ===================== Clash 配置模板 =====================
 dns:
   enable: true
-  enhanced-mode: redir-host        # 建议 redir-host；用 fake-ip(TUN) 也可
+  enhanced-mode: fake-ip           # fake-ip 分流更准；需要真实解析可改 redir-host
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:                  # 命中这些域名时返回真实 IP
+    - '*.lan'
+    - '*.local'
+    - '*.arpa'
+    - '+.stun.*'
+    - localhost.ptlogin2.qq.com
+    # - nas.example.com            # 让 NAS 域名走真实解析（需本地 DNS 能解析它）
   nameserver:
     - 119.29.29.29
     - 223.5.5.5
@@ -167,7 +177,13 @@ mode: Rule              # 运行模式：Rule(规则) / Global(全局) / Direct(
 log-level: info
 external-controller: 127.0.0.1:9090
 
-# 代理节点配置
+# 客户端行为（原先继承自机场，现改为本地声明；不需要就整行删掉）
+ipv6: false
+unified-delay: true
+keep-alive-interval: 360
+global-client-fingerprint: chrome
+
+# 代理节点配置（机场节点会自动补充进来，无需在此列出）
 proxies:
   - name: Home
     type: ss
@@ -177,19 +193,32 @@ proxies:
     password: change-me
     udp: true
 
-# 代理组配置
+# 代理组配置（只使用本文件中的配置，机场的代理组一律丢弃）
 proxy-groups:
   - name: 🏠 Nas           # 自定义组：回家走 Home 节点
     type: select
     proxies:
       - Home
       - DIRECT
-  - name: 🚀 节点选择       # 标准组（占位）：有订阅时被机场完整组覆盖，无订阅时兜底
+  - name: 🚀 节点选择       # 主选择组：手动挑选机场节点
     type: select
     proxies:
+      - ♻️ 自动选择
+      - "*"                # 展开为机场的全部节点
+      - DIRECT
+  - name: ♻️ 自动选择       # 自动测速：延迟最低的机场节点
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    proxies:
+      - "*"                # 展开为机场的全部节点
+  - name: 🐟 漏网之鱼       # 未匹配任何规则的流量
+    type: select
+    proxies:
+      - 🚀 节点选择
       - DIRECT
 
-# 规则配置（本地规则在前，优先级更高）
+# 规则配置（只使用本文件中的配置，机场的规则一律丢弃）
 rules:
   - IP-CIDR,192.168.80.0/24,🏠 Nas   # 改为你的局域网网段
   - DOMAIN-SUFFIX,nas.example.com,🏠 Nas

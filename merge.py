@@ -1,12 +1,17 @@
-"""Clash 配置合并核心（纯函数，不依赖 flask / gevent，便于测试）。
+"""Clash 配置转换核心（纯函数，不依赖 flask / gevent，便于测试）。
 
-合并原则（本地配置作为模板，节点与代理组以订阅优先）：
-1. 本地配置先剔除与控制项无关的 key（由调用方处理），以及 remove_keys 要求移除的 key。
-2. proxies / proxy-groups：按 name 合并去重，订阅（机场）同名项优先，本地仅补充机场
-   没有的新项；代理组额外支持 exclude_groups 剔除。
-3. 其他顶层 key：本地已有则用本地；本地没有且不在 remove_keys 中则用订阅的。
-4. rules：本地规则置于前面（Clash 自上而下匹配，本地自定义规则优先级更高），
-   按字符串去重，并剔除目标组在 exclude 中的规则。
+转换原则（本地配置是唯一的配置来源，机场只提供代理节点）：
+
+1. 输出配置的顶层 key **完全取自本地配置**——顺序与内容都以本地 config.yaml 为准，
+   机场除 `proxies`（代理节点）以外的内容一律不参与输出。
+2. `proxies`：本地节点 + 机场节点，按 `name` 去重，**本地同名优先**。
+3. 本地配置中可用表达式 `*` 指定「此处插入机场的全部节点」，可写在代理组的 `proxies`
+   列表，也可写在顶层 `proxies` 列表。展开的是**机场带来的节点**——与本地模板同名的
+   节点不算（本地定义优先）。表达式未出现时，机场节点统一追加到 `proxies` 末尾
+   （保证组内引用的节点有定义）。
+
+   注意：YAML 中该表达式必须写作 `- "*"`。裸写 `- *` 是 YAML 的别名（alias）语法，
+   解析直接失败。
 """
 
 from collections import OrderedDict
@@ -14,6 +19,15 @@ from copy import deepcopy
 
 import base64
 import yaml
+
+
+# 表达式：在本地配置中代表「机场的全部代理节点」
+REMOTE_PROXIES = '*'
+
+# Clash 内置策略：规则的 target 指向它们时不算悬空
+BUILTIN_POLICIES = {
+    'DIRECT', 'REJECT', 'REJECT-DROP', 'PASS', 'COMPATIBLE', 'GLOBAL',
+}
 
 
 def parse_clash(text):
@@ -41,178 +55,151 @@ def parse_clash(text):
     raise ValueError('订阅内容不是合法的 Clash YAML')
 
 
-def merge_named(local_list, remote_list, local_first, exclude=None):
-    """按 name 合并列表（proxies / proxy-groups），去重。
+def is_placeholder(item):
+    """判断列表项是否为「插入机场节点」表达式。"""
+    return isinstance(item, str) and item.strip() == REMOTE_PROXIES
 
-    local_first=True 时本地同名项优先；False 时机场同名项优先。
-    exclude 中的 name 会被整体剔除。
+
+def names_of(items):
+    """取出列表项的 name 列表（跳过无 name 的畸形项），proxies / proxy-groups 通用。"""
+    return [p['name'] for p in items or [] if isinstance(p, dict) and p.get('name')]
+
+
+def remote_index(remote_proxies):
+    """机场节点：name -> 定义（保持订阅中的顺序，同名只保留首个）。"""
+    idx = OrderedDict()
+    for p in remote_proxies or []:
+        if isinstance(p, dict) and p.get('name'):
+            idx.setdefault(p['name'], p)
+    return idx
+
+
+def merge_proxies(template_proxies, remote_nodes):
+    """合并代理节点：本地优先，机场节点补充；表达式控制机场节点的插入位置。
+
+    表达式未出现在本地 `proxies` 中时，机场节点统一追加到末尾。无论如何，
+    机场节点的**定义**都会进入输出，避免代理组引用了不存在的节点。
+
+    :param template_proxies: 本地模板的 proxies 列表
+    :param remote_nodes: remote_index() 的返回值（name -> 机场节点定义）
     """
-    exclude = set(exclude or [])
     merged = OrderedDict()
-    order = (local_list, remote_list) if local_first else (remote_list, local_list)
-    for lst in order:
-        for item in lst:
-            name = item.get('name') if isinstance(item, dict) else None
-            if not name or name in exclude:
-                continue
-            if name not in merged:
-                merged[name] = deepcopy(item)
+    placed = False
+    for item in template_proxies or []:
+        if is_placeholder(item):
+            placed = True
+            for name, node in remote_nodes.items():
+                merged.setdefault(name, deepcopy(node))
+            continue
+        if isinstance(item, dict) and item.get('name'):
+            merged.setdefault(item['name'], deepcopy(item))
+    if not placed:
+        for name, node in remote_nodes.items():
+            merged.setdefault(name, deepcopy(node))
     return list(merged.values())
 
 
-def merge_rules(local_rules, remote_rules, exclude=None):
-    """合并规则：本地规则优先（置于前面），按字符串去重。
+def expand_members(members, remote_names):
+    """展开代理组成员里的表达式，并按首次出现位置去重。"""
+    out = []
+    for m in members or []:
+        for name in (remote_names if is_placeholder(m) else [m]):
+            if name not in out:
+                out.append(name)
+    return out
 
-    剔除目标组（规则最后一个逗号字段，或 >=3 字段时的第 3 字段）在 exclude 中的规则。
-    """
-    exclude = set(exclude or [])
-    seen = set()
-    merged = []
-    for rule in list(local_rules) + list(remote_rules):
-        if not isinstance(rule, str) or not rule.strip():
+
+def merge_proxy_groups(template_groups, remote_names):
+    """代理组只使用本地配置，并把组内的表达式展开为机场节点名。"""
+    groups = []
+    for g in template_groups or []:
+        if not isinstance(g, dict):
             continue
-        if rule in seen:
+        g = deepcopy(g)
+        members = g.get('proxies')
+        if members is not None:
+            expanded = expand_members(members, remote_names)
+            # 展开后为空（组内原本只有表达式，且没有机场节点）时兜底 DIRECT，
+            # 避免输出非法配置：Clash 要求代理组至少有一个成员。
+            g['proxies'] = expanded or ['DIRECT']
+        groups.append(g)
+    return groups
+
+
+def find_dangling_rules(rules, group_names, node_names):
+    """找出目标不存在的规则（如仍指向机场组名）。"""
+    known = set(group_names or []) | set(node_names or []) | BUILTIN_POLICIES
+    dangling = []
+    for rule in rules or []:
+        if not isinstance(rule, str) or not rule.strip():
             continue
         parts = [p.strip() for p in rule.split(',')]
         target = parts[2] if len(parts) >= 3 else parts[-1]
-        if target in exclude:
-            continue
-        seen.add(rule)
-        merged.append(rule)
-    return merged
+        if target not in known:
+            dangling.append(rule)
+    return dangling
 
 
-def _rule_target_index(rule):
-    """返回规则中目标组字段的下标：>=3 字段时是第 3 字段，否则是最后一个字段。"""
-    parts = rule.split(',')
-    return 2 if len(parts) >= 3 else len(parts) - 1
+def find_dangling_members(groups, group_names, node_names):
+    """找出引用了不存在成员的代理组，返回 [(组名, 成员名)]。
 
-
-def redirect_rule_target(rule, sources, target):
-    """将规则中指向 sources 中任一组的字段改写为 target。"""
-    parts = rule.split(',')
-    idx = _rule_target_index(rule)
-    if parts[idx].strip() in sources:
-        parts[idx] = target
-        return ','.join(parts)
-    return rule
-
-
-def apply_merge_groups(groups, proxies, rules, merge_groups):
-    """指定代理组合并：把 sources 组列出的「节点」去重并入 target 组。
-
-    默认行为（可通过配置开关调整）：
-    - remove_sources=True：合并后从输出中删除源组；
-    - redirect_rules=True：规则中指向源组的目标自动改指 target，避免规则失效。
-
-    :param groups: 合并后的 proxy-groups 列表（就地修改）
-    :param proxies: 合并后的 proxies 列表（用于识别哪些名字是节点）
-    :param rules: 合并后的 rules 列表（就地修改）
-    :param merge_groups: [{'target','sources',...}, ...]
+    覆盖两类常见笔误：写错的节点名、以及旧版表达式 `__REMOTE_PROXIES__` 残留
+    （现已改为 `*`）。
     """
-    if not merge_groups:
-        return
-    proxy_names = {
-        p.get('name') for p in proxies
-        if isinstance(p, dict) and p.get('name')
-    }
-
-    for spec in merge_groups:
-        target = spec.get('target')
-        sources = set(spec.get('sources') or [])
-        if not target or not sources:
+    known = set(group_names or []) | set(node_names or []) | BUILTIN_POLICIES
+    bad = []
+    for g in groups or []:
+        if not isinstance(g, dict):
             continue
-        tg = next((g for g in groups
-                   if isinstance(g, dict) and g.get('name') == target), None)
-        if tg is None:
-            continue  # 目标组不存在（本地与订阅都没有），跳过
-
-        # 收集源组列出的节点（仅并入真正的节点，排除组名/内置策略/目标自身）
-        added = []
-        for src in sources:
-            sg = next((g for g in groups
-                       if isinstance(g, dict) and g.get('name') == src), None)
-            if sg is None:
-                continue
-            for member in (sg.get('proxies') or []):
-                if member in proxy_names and member != target and member not in added:
-                    added.append(member)
-
-        existing = list(tg.get('proxies') or [])
-        for m in added:
-            if m not in existing:
-                existing.append(m)
-        tg['proxies'] = existing
-
-        if spec.get('remove_sources', True):
-            groups[:] = [
-                g for g in groups
-                if not (isinstance(g, dict) and g.get('name') in sources)
-            ]
-            if spec.get('redirect_rules', True):
-                for i, rule in enumerate(rules):
-                    rules[i] = redirect_rule_target(rule, sources, target)
+        for m in g.get('proxies') or []:
+            if isinstance(m, str) and m not in known:
+                bad.append((g.get('name'), m))
+    return bad
 
 
-def merge_configs(template, remote, exclude_groups=None, remove_keys=None,
-                  merge_groups=None):
-    """合并本地模板与机场配置，返回合并后的 dict。
+def uses_remote_placeholder(template):
+    """本地配置是否用到了表达式（顶层 proxies 或任一代理组）。"""
+    seqs = [template.get('proxies')]
+    for g in template.get('proxy-groups') or []:
+        if isinstance(g, dict):
+            seqs.append(g.get('proxies'))
+    for seq in seqs:
+        if isinstance(seq, list) and any(is_placeholder(x) for x in seq):
+            return True
+    return False
 
-    输出顶层 key 顺序：订阅加载成功时按订阅配置的 key 顺序排列
-    （本地同名 key 用本地值覆盖，本地独有 key 追加末尾）；无订阅时按本地模板顺序。
+
+def merge_configs(template, remote):
+    """转换订阅：输出顶层 key 完全取自本地配置，机场只贡献代理节点。
+
+    输出 key 的**顺序与内容都以本地模板为准**，机场的顶层 key 一个都不会进入输出。
+    本地未定义 `proxies` 而机场有节点时，节点定义追加到末尾（否则代理组引用的
+    节点不存在，客户端会拒绝加载）。
 
     :param template: 本地 Clash 模板（已剔除控制项）
     :param remote: 机场配置 dict，或 None（无订阅时）
-    :param exclude_groups: 需排除的代理组 / 规则目标组名
-    :param remove_keys: 需要从最终配置中移除的顶层 key
-    :param merge_groups: 指定代理组合并：sources 组的节点并入 target 组
     """
-    if not remote:
-        return deepcopy(template)
+    remote = remote or {}
 
-    remove = set(remove_keys or [])
+    nodes = remote_index(remote.get('proxies') or [])
+    # 表达式展开的是「机场带来的节点」：与本地模板同名的节点不算（本地定义优先，
+    # 也避免第 3 步的最小配置（就是本地模板本身）被当成一份订阅重复插入）。
+    local_names = set(names_of(template.get('proxies') or []))
+    airport_nodes = OrderedDict(
+        (n, p) for n, p in nodes.items() if n not in local_names)
 
-    # 输出 key 顺序：订阅加载成功时按订阅配置的 key 顺序排列
-    # （本地同名 key 用本地值覆盖；本地独有且订阅没有的 key 按本地顺序追加到末尾；
-    #   proxies / proxy-groups / rules 在订阅原位置用合并结果填充）
+    # 用普通 dict 而非 OrderedDict：yaml.dump 会把 OrderedDict 序列化成
+    # !!python/object/apply:collections.OrderedDict，客户端无法解析。
+    # Python 3.7+ 的 dict 本身保序，足够。
     result = {}
-    for k, v in remote.items():
-        if k in remove:
-            continue
-        if k in ('proxies', 'proxy-groups', 'rules'):
-            result[k] = None          # 占位，稍后用合并结果填充，保持订阅中的位置
-        else:
-            result[k] = deepcopy(template.get(k, v))
-
-    # 本地独有、订阅没有且未要求移除的 key，按本地模板顺序追加
     for k, v in template.items():
-        if k in remove or k in result:
-            continue
-        result[k] = deepcopy(v)
+        if k == 'proxies':
+            result[k] = merge_proxies(v, airport_nodes)
+        elif k == 'proxy-groups':
+            result[k] = merge_proxy_groups(v, list(airport_nodes))
+        else:
+            result[k] = deepcopy(v)
 
-    # proxies / proxy-groups：订阅优先（机场同名项优先，本地仅补充新项）
-    result['proxies'] = merge_named(
-        template.get('proxies') or [],
-        remote.get('proxies') or [],
-        local_first=False,
-    )
-    result['proxy-groups'] = merge_named(
-        template.get('proxy-groups') or [],
-        remote.get('proxy-groups') or [],
-        local_first=False,
-        exclude=exclude_groups,
-    )
-    # rules：本地在前
-    result['rules'] = merge_rules(
-        template.get('rules') or [],
-        remote.get('rules') or [],
-        exclude_groups,
-    )
-    # 指定代理组合并（节点并入目标组、删除源组、规则改指）
-    apply_merge_groups(
-        result['proxy-groups'],
-        result['proxies'],
-        result['rules'],
-        merge_groups,
-    )
+    if 'proxies' not in template and airport_nodes:
+        result['proxies'] = [deepcopy(p) for p in airport_nodes.values()]
     return result

@@ -10,37 +10,184 @@ sub_url4: ""            # 备用订阅 4：?sub_url=4
 sub_url5: ""            # 备用订阅 5：?sub_url=5
 basic_auth: ""          # 动态更新 Home 节点 IP/端口 的基础认证，格式 username:password（可选）
 server_url: ""          # 获取 Home 节点最新 IP/端口 的服务地址（可选，为空则不刷新）
-exclude_groups:         # 合并时排除的「代理组名 / 规则目标组名」
-  - 🛑 全球拦截
-  - 🍃 应用净化
-remove_keys:            # 从最终配置中移除的顶层 key（如不想用机场的 dns/tun，取消注释即可）
-  # - dns
-  # - tun
-merge_groups:           # 指定代理组合并：把 sources 组的「节点」并入 target 组
-  # - target: 🚀 节点选择     # 合并目标组（订阅或本地中存在即可）
-  #   sources:                # 源组：这些组列出的节点会并入 target
-  #     - 国外媒体
-  #     - 电报
-  #   remove_sources: true    # 合并后删除源组（默认 true）
-  #   redirect_rules: true    # 规则中指向源组的自动改指 target（默认 true，防止规则失效）
-cache_ttl: 0         # 拉取失败时可回退的缓存有效期（秒），0 表示永不过期（进程内缓存，重启失效）；机场配置每次请求都实时拉取
+cache_ttl: 0            # 拉取失败时可回退的缓存有效期（秒），0 表示永不过期（进程内缓存，重启失效）；机场配置每次请求都实时拉取
 
-# ===================== Clash 配置模板（本地配置作为模板） =====================
-# 下列内容即为 Clash 配置本体，同时也是「订阅不可用时」的最小配置文件来源。合并策略：
-#   - proxies / proxy-groups：订阅（机场）同名项优先，本地仅补充机场没有的新项；
-#   - 其他顶层 key（port / mode / dns / tun / external-controller ...）：
-#     本地已有则用本地，本地没有且未在 remove_keys 中则用订阅的；
-#   - rules：本地规则置于最前（优先级更高）。
-port: 7890              # HTTP 代理端口
-socks-port: 7891        # SOCKS5 代理端口
-allow-lan: true         # 是否允许局域网访问
-mode: Rule              # 运行模式：Rule(规则) / Global(全局) / Direct(直连)
-log-level: info         # 日志级别
-external-controller: 127.0.0.1:9090
+# ===================== Clash 配置（本地为准，机场只提供代理节点） =====================
+# 通用项（port / dns / keep-alive-interval 等）取自机场官方 Clash 配置（2026-09-16 拉取），
+# 并参考「魔戒」机场配置补充了 fake-ip-filter 等通用项；代理组与代理规则为本地自定义。
+# 机场的 proxies / proxy-groups / rules 一律不参与输出，机场只贡献「代理节点」，
+# 由下方代理组里的 "*" 表达式指定插入位置。
+#
+# 转换规则：
+#   - 输出的顶层 key 完全按本文件（顺序与内容），机场的顶层 key 不参与；
+#   - proxies：本地节点 + 机场节点（按 name 去重，本地同名优先）；
+#   - "*"：展开为机场带来的全部节点。YAML 中必须写成 - "*"（带引号），
+#     裸写 - * 是 YAML 的别名（alias）语法，解析会直接失败；
+#   - 想在输出中临时去掉某项，直接注释掉对应配置即可。
 
-# 代理节点配置
+# --------------------- 端口 / 运行 ---------------------
+port: 7890                    # HTTP 代理端口
+socks-port: 7891              # SOCKS5 代理端口
+# 机场另有 redir-port: 7892（Linux iptables 透明转发）与 mixed-port: 7893（HTTP+SOCKS 混合端口），
+# 本机用不到故未启用；若客户端只支持混合端口，改用 mixed-port 并注释掉上面两行。
+ipv6: false                   # 是否解析并允许 AAAA 记录（机场值 false）
+udp: true                     # 允许 UDP 转发（QUIC / 游戏 / TUN 需要；机场未声明，本地保留）
+allow-lan: true               # 是否允许局域网访问（机场值 false；路由器 / 共享场景需要 true）
+bind-address: '*'             # 监听地址，配合 allow-lan（* = 所有网卡）
+mode: rule                    # 运行模式：rule(规则) / global(全局) / direct(直连)
+log-level: info               # 日志级别：silent / error / warning / info / debug
+unified-delay: true           # 用「统一延迟」口径显示节点延迟
+keep-alive-interval: 360      # TCP keep-alive 间隔（秒）
+global-client-fingerprint: chrome   # 全局 TLS 指纹（伪装成 Chrome）
+external-controller: 127.0.0.1:9090   # 控制端口（dashboard 用）；机场为 0.0.0.0:9090，本地收紧到仅本机
+
+# --------------------- DNS（抄自机场） ---------------------
+dns:
+  enable: true
+  listen: 127.0.0.1:5334      # DNS 监听端口（TUN / 其他设备指向本机时用）
+  default-nameserver:         # 仅用于解析下方 nameserver 里的 DoH 域名，必须填 IP
+    - 180.184.1.1
+    - 119.29.29.29
+    - 223.5.5.5
+  enhanced-mode: fake-ip      # fake-ip：先返回假地址，拿到域名后再分流
+  fake-ip-range: 198.18.0.1/16   # mihomo 默认段（魔戒用的是 28.0.0.1/8，需要时替换）
+  use-hosts: true             # 启用本文件下方的 hosts 段
+  use-system-hosts: true      # 同时读取系统 hosts
+  # fake-ip-filter：以下域名不做 fake-ip 转换，直接返回真实解析结果。
+  # 漏掉它们容易出现「NTP 对不上时间 / 音乐 App 打不开 / STUN 拿不到真实 IP / 局域网设备访问不了」。
+  fake-ip-filter:
+    # —— 局域网与保留域名
+    - '*.lan'
+    - '*.localdomain'
+    - '*.example'
+    - '*.invalid'
+    - '*.localhost'
+    - '*.test'
+    - '*.local'
+    - '*.home.arpa'
+    # —— 时间同步（NTP 客户端必须拿到真实 IP）
+    - time.*.com
+    - time.*.gov
+    - time.*.edu.cn
+    - time.*.apple.com
+    - time1.*.com
+    - time2.*.com
+    - time3.*.com
+    - time4.*.com
+    - time5.*.com
+    - time6.*.com
+    - time7.*.com
+    - ntp.*.com
+    - ntp1.*.com
+    - ntp2.*.com
+    - ntp3.*.com
+    - ntp4.*.com
+    - ntp5.*.com
+    - ntp6.*.com
+    - ntp7.*.com
+    - '*.time.edu.cn'
+    - '*.ntp.org.cn'
+    - +.pool.ntp.org
+    - time1.cloud.tencent.com
+    # —— 音乐 / 视频平台（走 fake-ip 会无法播放或登录）
+    - music.163.com
+    - '*.music.163.com'
+    - '*.126.net'
+    - musicapi.taihe.com
+    - music.taihe.com
+    - songsearch.kugou.com
+    - trackercdn.kugou.com
+    - '*.kuwo.cn'
+    - api-jooxtt.sanook.com
+    - api.joox.com
+    - joox.com
+    - y.qq.com
+    - '*.y.qq.com'
+    - streamoc.music.tc.qq.com
+    - mobileoc.music.tc.qq.com
+    - isure.stream.qqmusic.qq.com
+    - dl.stream.qqmusic.qq.com
+    - aqqmusic.tc.qq.com
+    - amobile.music.tc.qq.com
+    - '*.xiami.com'
+    - '*.music.migu.cn'
+    - music.migu.cn
+    # —— 系统连通性检测 / 系统更新
+    - +.msftconnecttest.com
+    - +.msftncsi.com
+    - msftconnecttest.com
+    - msftncsi.com
+    - localhost.ptlogin2.qq.com
+    - localhost.sec.qq.com
+    - mesu.apple.com
+    - swscan.apple.com
+    - swquery.apple.com
+    - swdownload.apple.com
+    - swcdn.apple.com
+    - swdist.apple.com
+    - lens.l.google.com
+    # —— 游戏平台 / STUN（P2P 打洞需要真实 IP）
+    - +.srv.nintendo.net
+    - +.stun.playstation.net
+    - xbox.*.microsoft.com
+    - xnotify.xboxlive.com
+    - +.ipv6.microsoft.com
+    - +.battlenet.com.cn
+    - +.wotgame.cn
+    - +.wggames.cn
+    - +.wowsgame.cn
+    - +.wargaming.net
+    - proxy.golang.org
+    - stun.*.*
+    - stun.*.*.*
+    - +.stun.*.*
+    - +.stun.*.*.*
+    - +.stun.*.*.*.*
+    - stun.l.google.com
+    - '*.square-enix.com'
+    - '*.finalfantasyxiv.com'
+    - '*.ffxiv.com'
+    - '*.ff14.sdo.com'
+    - ff.dorado.sdo.com
+    - '*.mcdn.bilivideo.cn'
+    - +.media.dssott.com
+    - +.pvp.net
+    # —— 路由器 / 网关管理页
+    - heartbeat.belkin.com
+    - '*.linksys.com'
+    - '*.linksyssmartwifi.com'
+    - '*.router.asus.com'
+  nameserver-policy:          # 按域名指定 DNS：国内 / 私有域名走国内解析
+    geosite:cn,private:
+      - 119.29.29.29
+      - 223.5.5.5
+      - system
+  nameserver:                 # 其余域名走加密 DNS（DoH）；后两条明文 IP 作兜底（DoH 域名解析失败时仍可用）
+    - https://223.6.6.6/dns-query
+    - https://doh.pub/dns-query
+    - 119.29.29.29
+    - 223.5.5.5
+  proxy-server-nameserver:    # 专门解析代理节点服务器地址；不能走代理，否则死循环
+    - https://223.5.5.5/dns-query
+    - https://doh.pub/dns-query
+  # 说明：魔戒配置里另有 fallback / fallback-filter，但它给的 fallback 与 nameserver 是同一批国内
+  # DNS，起不到「国外 DNS 交叉验证防污染」的作用；mihomo 现已推荐用 proxy-server-nameserver +
+  # nameserver-policy 替代，故本模板不启用。另：魔戒的 dns.ipv6: true 与本文件顶层 ipv6: false
+  # 冲突，两者需保持一致，此处跟随顶层保持不返回 AAAA。
+
+experimental:
+  ignore-resolve-fail: true   # DNS 解析失败时忽略，避免因解析失败直接断连（本地补充）
+
+hosts:                        # 强制指定解析结果（不改变 DNS 行为，仅本机生效；本地补充）
+  'mtalk.google.com': 108.177.125.188
+  'services.googleapis.cn': 74.125.203.94
+
+# 机场配置里另有 clash-for-android（Android 客户端专用）、cfw-bypass（Clash for Windows 专用）、
+# ntp（NTP 时间同步）三段，属特定客户端 / 特定平台，本机用不到，故未抄录。
+
+# --------------------- 代理节点（本地节点；机场节点由 "*" 表达式插入） ---------------------
 proxies:
-  - name: Home
+  - name: Home                # 占位值；配置 server_url 后每次请求都会刷新为最新 IP / 端口
     type: ss
     server: 11.11.11.11
     port: 11
@@ -48,42 +195,63 @@ proxies:
     password: 1234
     udp: true
 
-# 代理组配置
+# --------------------- 代理组（全部本地定义，机场的组一律丢弃） ---------------------
+# 书写顺序 = 客户端 UI 里的显示顺序。"*" 展开为机场带来的全部节点（本地节点不参与展开）。
 proxy-groups:
-  - name: 🏠 回家          # 自定义组：回家走 Home 节点
+  - name: 🚀 节点选择          # 手动挑选：机场节点 + 自动选择
     type: select
     proxies:
-      - Home
+      - ♻️ 自动选择
+      - "*"
+  - name: ♻️ 自动选择          # 自动选延迟最低的机场节点
+    type: url-test
+    url: http://www.google-analytics.com/generate_204   # 探测地址（同机场）
+    interval: 300             # 探测间隔（秒）
+    tolerance: 50             # 延迟差在此范围内不切换，避免抖动
+    proxies:
+      - "*"
+  - name: 🎯 全球直连
+    type: select
+    proxies:
       - DIRECT
-  - name: 🤖 Github        # 自定义组：GitHub 走机场
+      - 🚀 节点选择
+      - ♻️ 自动选择
+  - name: 🐟 漏网之鱼          # 兜底：未命中任何规则的流量
     type: select
     proxies:
       - 🚀 节点选择
       - ♻️ 自动选择
-      - 🎯 全球直连
-  - name: 🚀 节点选择       # 标准组（占位）：有订阅时被机场完整组覆盖，无订阅时兜底
+      - DIRECT
+  - name: 🏠 回家              # 回家 / 内网：默认走 Home 本地节点
     type: select
     proxies:
+      - Home
+      - 🚀 节点选择
       - DIRECT
-  - name: ♻️ 自动选择       # 标准组（占位）
+  - name: 🤖 GITHUB            # GitHub 相关域名
     type: select
     proxies:
+      - 🚀 节点选择
+      - ♻️ 自动选择
       - DIRECT
-  - name: 🎯 全球直连       # 标准组（占位）
-    type: select
-    proxies:
-      - DIRECT
-  - name: 🐟 漏网之鱼       # 标准组（占位）
-    type: select
-    proxies:
-      - DIRECT
+  # 需要更多分流组时，按上面的写法在本地补充即可。
+  # 魔戒用的组名可作参考：ChatGPT / Gemini / Netflix / Telegram / TikTok / Twitter /
+  # WhatsApp / 哔哩哔哩 / 抖音 / 磁力下载 / 微软服务 / 苹果服务 / 谷歌服务 / Steam / Copilot。
+  # 例（取消注释即生效，注意同时补一条指向该组的规则）：
+  # - name: Netflix
+  #   type: select
+  #   proxies:
+  #     - 🚀 节点选择
+  #     - ♻️ 自动选择
+  #     - 🎯 全球直连
 
-# 规则配置（本地规则在前，优先级更高）
+# --------------------- 规则（全部本地定义，机场的规则一律丢弃） ---------------------
+# 规则自上而下匹配，首条命中生效；最后必须有一条 MATCH 兜底。
 rules:
-  - DOMAIN-SUFFIX,githubcopilot.com,🤖 Github
-  - DOMAIN-SUFFIX,github.com,🤖 Github
-  - DOMAIN-SUFFIX,githubassets.com,🤖 Github
-  - DOMAIN-SUFFIX,githubusercontent.com,🤖 Github
+  - DOMAIN-SUFFIX,githubcopilot.com,🤖 GITHUB
+  - DOMAIN-SUFFIX,github.com,🤖 GITHUB
+  - DOMAIN-SUFFIX,githubassets.com,🤖 GITHUB
+  - DOMAIN-SUFFIX,githubusercontent.com,🤖 GITHUB
   - IP-CIDR,192.168.80.0/24,🏠 回家
   - DOMAIN-SUFFIX,nx56.top,🏠 回家
   - MATCH,🐟 漏网之鱼

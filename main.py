@@ -4,7 +4,8 @@
   1. 根据配置拉取机场订阅（sub_url 取自请求参数或 config.yaml，每次请求都实时拉取）；
   2. 拉取失败时使用本地缓存（cache_ttl 有效期内的那一份）；
   3. 缓存未命中时，根据本地配置生成最小配置文件（仅本地节点，不含机场内容）；
-  4. 根据本地配置转换订阅文件：补充本地节点、修正代理规则与代理组。
+  4. 根据本地配置转换订阅文件：除代理节点外只使用本地配置，机场只贡献代理节点
+     （插入位置由本地配置中的 * 表达式指定）。
 """
 
 from gevent import monkey
@@ -41,10 +42,13 @@ CONTROL_KEYS = {
     'password',                     # 接口访问密码
     'basic_auth',                   # 动态更新 Home 节点 IP/端口 的基础认证 username:password
     'server_url',                   # 获取 Home 节点最新 IP/端口 的服务地址
-    'exclude_groups',               # 合并时排除的代理组 / 规则目标组
-    'remove_keys',                  # 从最终配置中移除的顶层 key
-    'merge_groups',                 # 指定代理组合并：sources 组节点并入 target 组
     'cache_ttl',                    # 机场配置缓存时长（秒，0 表示不过期）
+    # 以下三项已废弃：输出顶层 key 完全取自本地配置，无需再剥离；代理组与规则
+    # 也只取本地配置，无需再排除/合并机场的组。
+    # 仍列在控制项中，只为把旧配置里的残留剥离掉，避免泄漏进输出的 Clash 配置。
+    'remove_keys',
+    'exclude_groups',
+    'merge_groups',
 } | set(SUB_URL_KEYS)               # sub_url / sub_url1 ~ sub_url5
 
 app = Flask(__name__)
@@ -276,7 +280,8 @@ def build_minimal_config(template):
     """流程第 3 步：机场订阅与缓存都不可用时，根据本地配置生成最小配置文件。
 
     本地模板本身就是最小可用配置：只含本地节点（Home）与本地代理组 / 规则，
-    不含任何机场内容，客户端仍能正常分流（本地规则生效，其余走直连）。
+    不含任何机场内容。本地代理组里的 * 表达式在第 4 步展开为空，
+    组内保留其余本地成员（整组为空时兜底 DIRECT），客户端仍能正常分流。
     """
     logging.info("第 3 步：订阅拉取失败且缓存未命中，根据本地配置生成最小配置文件")
     return deepcopy(template)
@@ -304,28 +309,53 @@ def load_subscription(sub_url, control, template):
 
 # ===================== 流程第 4 步：订阅文件转换（合并入口） =====================
 def convert(sub_url, control, template):
-    """流程第 4 步：根据本地配置转换订阅文件——补充本地节点、修正代理规则与代理组。
+    """流程第 4 步：根据本地配置转换订阅文件。
 
-    输入取自 load_subscription()（机场订阅 / 缓存 / 本地最小配置），
-    合并策略见 merge.merge_configs()：节点与代理组以订阅优先、本地补充，
-    本地规则置于最前，并按 exclude_groups / remove_keys / merge_groups 调整。
+    转换规则（详见 merge.merge_configs）：
+    - 输出顶层 key 完全取自本地配置，机场除代理节点外的内容一律丢弃；
+    - 代理节点 = 本地节点 + 机场节点（按 name 去重，本地同名优先）；
+    - 机场节点的插入位置由本地配置中的 merge.REMOTE_PROXIES 表达式（`*`）指定。
     """
     apply_home_cache(template)
 
+    if any(control.get(k) for k in ('remove_keys', 'exclude_groups', 'merge_groups')):
+        logging.info("第 4 步：remove_keys / exclude_groups / merge_groups 已废弃"
+                     "（输出只用本地配置），本次忽略")
+
     remote, userinfo = load_subscription(sub_url, control, template)
 
-    merged = merge.merge_configs(
-        template, remote,
-        exclude_groups=control.get('exclude_groups') or [],
-        remove_keys=control.get('remove_keys') or [],
-        merge_groups=control.get('merge_groups') or [],
-    )
+    merged = merge.merge_configs(template, remote)
+
+    remote_count = len((remote or {}).get('proxies') or [])
     logging.info(
-        "第 4 步：转换完成，节点 %d 个 / 代理组 %d 个 / 规则 %d 条",
-        len(merged.get('proxies') or []),
+        "第 4 步：转换完成，节点 %d 个（含机场 %d 个）/ 代理组 %d 个 / 规则 %d 条",
+        len(merged.get('proxies') or []), remote_count,
         len(merged.get('proxy-groups') or []),
         len(merged.get('rules') or []),
     )
+    if remote_count and not merge.uses_remote_placeholder(template):
+        logging.warning(
+            "第 4 步：本地配置未使用 %s 表达式，机场 %d 个节点未被任何代理组引用",
+            merge.REMOTE_PROXIES, remote_count)
+
+    group_names = merge.names_of(merged.get('proxy-groups') or [])
+    node_names = merge.names_of(merged.get('proxies') or [])
+
+    dangling = merge.find_dangling_rules(merged.get('rules') or [], group_names, node_names)
+    if dangling:
+        logging.warning(
+            "第 4 步：%d 条规则的目标不存在（需在本地配置中定义对应的组或节点）: %s",
+            len(dangling), dangling[:3],
+        )
+
+    bad_members = merge.find_dangling_members(
+        merged.get('proxy-groups') or [], group_names, node_names)
+    if bad_members:
+        logging.warning(
+            "第 4 步：%d 个代理组成员不存在（检查拼写；旧版表达式 __REMOTE_PROXIES__ "
+            "现已改为 \"%s\"）: %s",
+            len(bad_members), merge.REMOTE_PROXIES, bad_members[:3],
+        )
     return yaml.dump(merged, allow_unicode=True, sort_keys=False), userinfo
 
 

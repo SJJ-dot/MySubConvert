@@ -1,5 +1,7 @@
-"""合并逻辑测试：覆盖本地优先、列表去重、代理组机场优先、rules 顺序、
-exclude_groups、remove_keys、空 sub_url、merge_groups、fetch_remote 真实路径等场景。"""
+"""合并逻辑测试：覆盖「本地配置为准」的模型（除代理节点外只使用本地配置、
+表达式 `*` 展开、顶层 key 与顺序完全取自本地）、空 sub_url、fetch_remote 真实路径、
+多订阅地址等场景。"""
+import copy
 import os
 import sys
 import time
@@ -12,20 +14,21 @@ import main
 
 
 FAKE_REMOTE = {
-    'port': 8888,                       # 与本地不同，用于验证「本地优先覆盖」
+    # 与本地同名的 key：必须用本地的值
+    'port': 8888,
+    # 机场独有的 key：一律不得进入输出
     'dns': {'enable': True, 'nameserver': ['1.1.1.1']},
+    'mixed-port': 7893,
+    'unified-delay': False,
+    'cfw-bypass': ['localhost'],
     'proxies': [
         {'name': 'Airport-HK', 'type': 'ss', 'server': '1.2.3.4', 'port': 100},
         {'name': 'Airport-JP', 'type': 'ss', 'server': '5.6.7.8', 'port': 200},
     ],
+    # 以下代理组与规则应当被整体丢弃（只使用本地配置）
     'proxy-groups': [
         {'name': '🚀 节点选择', 'type': 'select',
          'proxies': ['Airport-HK', 'Airport-JP', 'DIRECT']},
-        {'name': '♻️ 自动选择', 'type': 'url-test',
-         'proxies': ['Airport-HK', 'Airport-JP'], 'url': 'http://test', 'interval': 300},
-        {'name': '🎯 全球直连', 'type': 'select', 'proxies': ['DIRECT']},
-        {'name': '🐟 漏网之鱼', 'type': 'select',
-         'proxies': ['🚀 节点选择', 'DIRECT']},
         {'name': '🛑 全球拦截', 'type': 'select', 'proxies': ['REJECT', 'DIRECT']},
     ],
     'rules': [
@@ -34,82 +37,134 @@ FAKE_REMOTE = {
     ],
 }
 
+# 一个不依赖真实 config.yaml 的最小本地模板，用于精确断言表达式展开行为
+LOCAL_TEMPLATE = {
+    'port': 7890,
+    'proxies': [{'name': 'Home', 'type': 'ss', 'server': '10.0.0.1', 'port': 1}],
+    'proxy-groups': [
+        {'name': '🏠 回家', 'type': 'select', 'proxies': ['Home', 'DIRECT']},
+        {'name': '🚀 节点选择', 'type': 'select',
+         'proxies': ['♻️ 自动选择', '*', 'DIRECT']},
+        {'name': '♻️ 自动选择', 'type': 'url-test', 'url': 'http://t', 'interval': 300,
+         'proxies': ['*']},
+        {'name': '🐟 漏网之鱼', 'type': 'select', 'proxies': ['🚀 节点选择', 'DIRECT']},
+    ],
+    'rules': ['DOMAIN-SUFFIX,github.com,🚀 节点选择', 'MATCH,🐟 漏网之鱼'],
+}
+
+
+def _tpl():
+    return copy.deepcopy(LOCAL_TEMPLATE)
+
 
 def _load_template():
     _, template = main.load_local_config()
     return template
 
 
-def test_top_level_local_override_and_remote_keep():
-    template = _load_template()
-    out = merge.merge_configs(template, dict(FAKE_REMOTE))
-    # 本地 port 7890 覆盖机场 8888
+def test_remote_top_level_keys_never_enter_output():
+    """机场除 proxies 外的顶层 key 一律不进输出；输出 key 顺序与内容完全按本地配置。"""
+    out = merge.merge_configs(_tpl(), dict(FAKE_REMOTE))
+    local_keys = set(LOCAL_TEMPLATE)
+    airport_only = [k for k in FAKE_REMOTE if k not in local_keys]
+    assert airport_only, 'FAKE_REMOTE 应包含机场独有 key'
+    for k in airport_only:
+        assert k not in out, '机场独有 key %r 不应进入输出' % k
+    # 同名 key 用本地的值
     assert out['port'] == 7890, out.get('port')
-    # 机场独有 key 保留
-    assert out['dns'] == {'enable': True, 'nameserver': ['1.1.1.1']}
-    # 本地 external-controller 保留
-    assert out['external-controller'] == '127.0.0.1:9090'
-    print('[OK] 顶层 key：本地已有用本地，本地没有用订阅的')
+    # 顶层 key 列表（含顺序）与本地模板完全一致
+    assert list(out) == list(LOCAL_TEMPLATE), list(out)
+    print('[OK] 顶层 key：机场内容（节点除外）不进输出，顺序按本地配置')
 
 
-def test_proxies_merge_subscription_priority():
+def test_remote_content_groups_and_rules_discarded():
+    """机场的代理组与规则整体丢弃（即使与本地组同名）。"""
+    out = merge.merge_configs(_tpl(), dict(FAKE_REMOTE))
+    groups = merge.names_of(out['proxy-groups'])
+    assert groups == ['🏠 回家', '🚀 节点选择', '♻️ 自动选择', '🐟 漏网之鱼'], groups
+    assert out['rules'] == LOCAL_TEMPLATE['rules'], out['rules']
+    assert not any('google.com' in r for r in out['rules'])
+    print('[OK] proxy-groups / rules：完全来自本地配置')
+
+
+def test_proxies_local_first_remote_appended():
     template = _load_template()
     out = merge.merge_configs(template, dict(FAKE_REMOTE))
-    names = [p['name'] for p in out['proxies']]
-    # 订阅节点在前，本地 Home 作为新项补充
-    assert names == ['Airport-HK', 'Airport-JP', 'Home'], names
-    print('[OK] proxies：订阅优先（机场节点在前），本地新项补充')
+    names = merge.names_of(out['proxies'])
+    # 本地节点在前，机场节点补充在后（本地模板未使用表达式）
+    assert names == ['Home', 'Airport-HK', 'Airport-JP'], names
+    print('[OK] proxies：本地节点在前，机场节点补充在后')
 
 
-def test_proxy_groups_subscription_priority():
-    template = _load_template()
-    out = merge.merge_configs(template, dict(FAKE_REMOTE))
+def test_proxy_groups_local_only_with_placeholder():
+    out = merge.merge_configs(_tpl(), dict(FAKE_REMOTE))
     groups = {g['name']: g for g in out['proxy-groups']}
-    # 机场完整组覆盖本地占位 [DIRECT]
-    assert groups['🚀 节点选择']['proxies'] == ['Airport-HK', 'Airport-JP', 'DIRECT'], groups['🚀 节点选择']
-    # 本地自定义组被保留
-    assert '🏠 回家' in groups and '🤖 Github' in groups
-    print('[OK] proxy-groups：订阅优先（占位组被完整组覆盖），自定义组保留')
+    # 表达式就地展开为机场节点名
+    assert groups['🚀 节点选择']['proxies'] == \
+        ['♻️ 自动选择', 'Airport-HK', 'Airport-JP', 'DIRECT'], groups['🚀 节点选择']
+    assert groups['♻️ 自动选择']['proxies'] == ['Airport-HK', 'Airport-JP']
+    # 本地自定义组不受影响
+    assert groups['🏠 回家']['proxies'] == ['Home', 'DIRECT']
+    print('[OK] proxy-groups：只取本地配置，表达式展开为机场节点')
 
 
-def test_exclude_groups():
-    template = _load_template()
-    out = merge.merge_configs(template, dict(FAKE_REMOTE), exclude_groups=['🛑 全球拦截'])
-    names = [g['name'] for g in out['proxy-groups']]
-    assert '🛑 全球拦截' not in names, names
-    # 规则中目标组为 🛑 全球拦截 的也被剔除（本例无，下面验证规则剔除）
-    out2 = merge.merge_configs(
-        template, dict(FAKE_REMOTE),
-        exclude_groups=['🚀 节点选择'])
-    assert 'DOMAIN-SUFFIX,google.com,🚀 节点选择' not in out2['rules']
-    print('[OK] exclude_groups：代理组与对应规则均被剔除')
+def test_local_node_wins_over_remote_same_name():
+    remote = {'proxies': [{'name': 'Home', 'type': 'ss', 'server': '9.9.9.9', 'port': 9}]}
+    out = merge.merge_configs(_tpl(), remote)
+    home = [p for p in out['proxies'] if p['name'] == 'Home']
+    assert len(home) == 1 and home[0]['server'] == '10.0.0.1', home
+    # 同名节点不算「机场带来的节点」，不会插进表达式位置
+    groups = {g['name']: g for g in out['proxy-groups']}
+    assert groups['♻️ 自动选择']['proxies'] == ['DIRECT'], groups['♻️ 自动选择']
+    print('[OK] proxies：本地与机场同名节点，本地定义优先且不插入表达式位置')
 
 
-def test_remove_keys():
-    template = _load_template()
-    out = merge.merge_configs(template, dict(FAKE_REMOTE), remove_keys=['dns'])
-    assert 'dns' not in out, 'dns 应被剥离'
-    # remove_keys 对本地已有的 key 同样生效
-    out2 = merge.merge_configs(template, dict(FAKE_REMOTE), remove_keys=['port'])
-    assert 'port' not in out2, '本地 port 也应被剥离'
-    print('[OK] remove_keys：订阅与本地 key 均可被剥离')
+def test_placeholder_absent_appends_nodes_and_warns():
+    tpl = _tpl()
+    # 去掉所有表达式
+    for g in tpl['proxy-groups']:
+        g['proxies'] = [m for m in g['proxies'] if m != '*']
+    assert merge.uses_remote_placeholder(tpl) is False
+    out = merge.merge_configs(tpl, dict(FAKE_REMOTE))
+    names = merge.names_of(out['proxies'])
+    assert names == ['Home', 'Airport-HK', 'Airport-JP'], names   # 节点定义仍保留
+    for g in out['proxy-groups']:
+        assert 'Airport-HK' not in (g.get('proxies') or []), g
+    print('[OK] 未使用表达式：机场节点仍保留定义，但不进入任何代理组')
 
 
-def test_rules_local_first():
-    template = _load_template()
-    out = merge.merge_configs(template, dict(FAKE_REMOTE))
-    # 本地规则应在机场规则之前
-    local_first = out['rules'][0]
-    assert local_first.startswith('DOMAIN-SUFFIX,githubcopilot.com'), out['rules'][:2]
-    # MATCH 规则去重（本地无 MATCH，机场有 MATCH）
-    assert out['rules'].count('MATCH,🐟 漏网之鱼') == 1
-    print('[OK] rules：本地规则在前，去重生效')
+def test_placeholder_in_top_level_proxies():
+    tpl = _tpl()
+    tpl['proxies'] = ['*', {'name': 'Home', 'type': 'ss', 'server': '10.0.0.1', 'port': 1}]
+    assert merge.uses_remote_placeholder(tpl) is True
+    out = merge.merge_configs(tpl, dict(FAKE_REMOTE))
+    assert merge.names_of(out['proxies']) == ['Airport-HK', 'Airport-JP', 'Home']
+    print('[OK] 顶层 proxies 中的表达式：按位置插入机场节点')
+
+
+def test_nodes_added_even_if_local_has_no_proxies_key():
+    """本地没写 proxies 段时，机场节点定义仍须输出，否则组内引用会悬空。"""
+    tpl = {'port': 7890,
+           'proxy-groups': [{'name': 'G', 'type': 'select', 'proxies': ['*']}]}
+    out = merge.merge_configs(tpl, dict(FAKE_REMOTE))
+    assert merge.names_of(out['proxies']) == ['Airport-HK', 'Airport-JP']
+    assert 'proxies' in list(out) and list(out)[-1] == 'proxies', list(out)
+    print('[OK] 本地无 proxies 段：机场节点定义追加到末尾')
+
+
+def test_empty_remote_expands_to_empty():
+    """无机场节点时表达式展开为空：组内保留其余成员，整组为空则兜底 DIRECT。"""
+    out = merge.merge_configs(_tpl(), None)
+    groups = {g['name']: g for g in out['proxy-groups']}
+    assert groups['🚀 节点选择']['proxies'] == ['♻️ 自动选择', 'DIRECT']
+    assert groups['♻️ 自动选择']['proxies'] == ['DIRECT']
+    assert '*' not in yaml.safe_dump(out, allow_unicode=True)
+    print('[OK] 无机场节点：表达式展开为空，整组为空时兜底 DIRECT')
 
 
 def test_empty_remote_returns_template():
     template = _load_template()
     out = merge.merge_configs(template, None)
-    # 空订阅时返回完整本地模板（含占位标准组）
     names = [g['name'] for g in out['proxy-groups']]
     assert '🚀 节点选择' in names and '🏠 回家' in names
     print('[OK] 空订阅：返回完整本地模板')
@@ -123,82 +178,52 @@ def test_base64_fallback():
     print('[OK] base64 兜底解析')
 
 
+def test_find_dangling_rules():
+    rules = [
+        'DOMAIN-SUFFIX,a.com,机场组',      # 组不存在 → 悬空
+        'MATCH,🐟 漏网之鱼',                # 本地组 → 正常
+        'IP-CIDR,1.1.1.1/32,DIRECT',       # 内置策略 → 正常
+        'DOMAIN-SUFFIX,b.com,Home',        # 指向节点名 → 正常
+    ]
+    dangling = merge.find_dangling_rules(rules, ['🐟 漏网之鱼'], ['Home'])
+    assert dangling == ['DOMAIN-SUFFIX,a.com,机场组'], dangling
+    print('[OK] find_dangling_rules：识别目标不存在的规则')
+
+
+def test_find_dangling_members():
+    """代理组引用了不存在的成员（含旧版表达式残留）应被识别。"""
+    groups = [
+        {'name': 'G1', 'type': 'select', 'proxies': ['Home', 'DIRECT']},
+        {'name': 'G2', 'type': 'select', 'proxies': ['__REMOTE_PROXIES__', '不存在节点']},
+        {'name': 'G3', 'type': 'select', 'proxies': ['G1', 'REJECT']},
+    ]
+    bad = merge.find_dangling_members(groups, ['G1', 'G2', 'G3'], ['Home'])
+    assert bad == [('G2', '__REMOTE_PROXIES__'), ('G2', '不存在节点')], bad
+    print('[OK] find_dangling_members：识别无效成员与旧表达式残留')
+
+
 def test_full_convert_with_mock(monkeypatch):
     control = {
-        'exclude_groups': ['🛑 全球拦截'],
-        'remove_keys': [],
+        'exclude_groups': ['🛑 全球拦截'],   # 已废弃，应被忽略且不影响输出
         'cache_ttl': 0,
     }
     template = _load_template()
-    monkeypatch.setattr(main, 'fetch_remote', lambda sub_url, ttl=0: (dict(FAKE_REMOTE), 'upload=1; download=2'))
+    monkeypatch.setattr(main, 'fetch_remote',
+                        lambda sub_url, ttl=0: (dict(FAKE_REMOTE), 'upload=1; download=2'))
     text, userinfo = main.convert('http://fake', control, template)
     out = yaml.safe_load(text)
-    assert out['port'] == 7890                       # 本地有 port，用本地
-    assert 'dns' in out                               # 本地无 dns，用订阅的
-    assert [p['name'] for p in out['proxies']] == ['Airport-HK', 'Airport-JP', 'Home']
-    assert '🛑 全球拦截' not in [g['name'] for g in out['proxy-groups']]
-    print('[OK] convert 全链路（mock 机场）：合并正确')
-
-
-def test_merge_groups_nodes_merged():
-    template = _load_template()
-    remote = {
-        'proxies': [
-            {'name': 'HK', 'type': 'ss', 'server': '1.1.1.1', 'port': 1},
-            {'name': 'JP', 'type': 'ss', 'server': '2.2.2.2', 'port': 2},
-            {'name': 'US', 'type': 'ss', 'server': '3.3.3.3', 'port': 3},
-        ],
-        'proxy-groups': [
-            {'name': '🚀 节点选择', 'type': 'select', 'proxies': ['HK', 'DIRECT']},
-            {'name': '国外媒体', 'type': 'url-test',
-             'proxies': ['HK', 'JP', 'US'], 'url': 'http://t', 'interval': 300},
-            {'name': '电报', 'type': 'select', 'proxies': ['JP', 'US', 'DIRECT']},
-            {'name': '🐟 漏网之鱼', 'type': 'select', 'proxies': ['🚀 节点选择', 'DIRECT']},
-        ],
-        'rules': [
-            'DOMAIN-SUFFIX,netflix.com,国外媒体',
-            'DOMAIN-SUFFIX,t.me,电报',
-            'MATCH,🐟 漏网之鱼',
-        ],
-    }
-    spec = {'target': '🚀 节点选择', 'sources': ['国外媒体', '电报']}
-    out = merge.merge_configs(template, remote, merge_groups=[spec])
-    groups = {g['name']: g for g in out['proxy-groups']}
-    # 源组节点并入目标组：HK(已有) 去重，新增 JP/US；DIRECT/组名不并入
-    assert groups['🚀 节点选择']['proxies'] == ['HK', 'DIRECT', 'JP', 'US'], groups['🚀 节点选择']
-    # 源组被删除
-    assert '国外媒体' not in groups and '电报' not in groups
-    # 规则自动改指目标组
-    assert 'DOMAIN-SUFFIX,netflix.com,🚀 节点选择' in out['rules']
-    assert 'DOMAIN-SUFFIX,t.me,🚀 节点选择' in out['rules']
-    assert '国外媒体' not in ','.join(out['rules'])
-    print('[OK] merge_groups：节点并入+去重、源组删除、规则改指')
-
-
-def test_merge_groups_keep_sources():
-    template = _load_template()
-    remote = {
-        'proxies': [
-            {'name': 'HK', 'type': 'ss', 'server': '1.1.1.1', 'port': 1},
-            {'name': 'US', 'type': 'ss', 'server': '3.3.3.3', 'port': 3},
-        ],
-        'proxy-groups': [
-            {'name': '🚀 节点选择', 'type': 'select', 'proxies': ['HK']},
-            {'name': '国外媒体', 'type': 'url-test',
-             'proxies': ['HK', 'US'], 'url': 'http://t', 'interval': 300},
-            {'name': '🐟 漏网之鱼', 'type': 'select', 'proxies': ['🚀 节点选择', 'DIRECT']},
-        ],
-        'rules': ['DOMAIN-SUFFIX,netflix.com,国外媒体'],
-    }
-    spec = {'target': '🚀 节点选择', 'sources': ['国外媒体'],
-            'remove_sources': False, 'redirect_rules': False}
-    out = merge.merge_configs(template, remote, merge_groups=[spec])
-    groups = {g['name']: g for g in out['proxy-groups']}
-    # 保留源组：节点并入，但源组与规则均不变
-    assert groups['🚀 节点选择']['proxies'] == ['HK', 'US'], groups['🚀 节点选择']
-    assert '国外媒体' in groups
-    assert 'DOMAIN-SUFFIX,netflix.com,国外媒体' in out['rules']
-    print('[OK] merge_groups：remove_sources=false 时保留源组与规则')
+    assert out['port'] == 7890                          # 本地有 port，用本地
+    # 本地有 dns，机场的 dns 不得覆盖
+    assert out['dns']['enhanced-mode'] == 'fake-ip', out['dns']
+    assert out['dns']['nameserver'] != ['1.1.1.1']
+    assert 'mixed-port' not in out                      # 机场独有 key 不进输出
+    assert 'cfw-bypass' not in out
+    assert merge.names_of(out['proxies']) == ['Home', 'Airport-HK', 'Airport-JP']
+    groups = merge.names_of(out['proxy-groups'])
+    assert '🛑 全球拦截' not in groups                    # 机场组一律丢弃
+    assert '🏠 回家' in groups and '🚀 节点选择' in groups
+    assert not any('google.com' in r for r in out['rules'])
+    print('[OK] convert 全链路（mock 机场）：本地配置 + 机场节点')
 
 
 class _FakeResp:
@@ -281,7 +306,8 @@ def test_fetch_remote_fail_no_cache(monkeypatch):
     print('[OK] fetch_remote：失败且无缓存返回 (None, "")')
 
 
-def test_output_key_order_follows_subscription():
+def test_output_key_order_follows_local():
+    """输出顶层 key 顺序完全按本地配置（机场顺序不参与）。"""
     template = _load_template()
     remote = {
         'mixed-port': 7893,
@@ -292,18 +318,10 @@ def test_output_key_order_follows_subscription():
         'rules': ['MATCH,🐟 漏网之鱼'],
     }
     out = merge.merge_configs(template, remote)
-    keys = list(out.keys())
-    sub_order = ['mixed-port', 'dns', 'port', 'proxies', 'proxy-groups', 'rules']
-    idx = {k: keys.index(k) for k in sub_order}
-    # 订阅配置内部的 key 顺序保持
-    assert [idx[k] for k in sub_order] == sorted(idx.values()), keys
-    # 本地独有 key 全部排在订阅 key 之后
-    local_only = [k for k in keys if k not in set(sub_order)]
-    assert local_only, '应存在本地独有 key'
-    assert max(idx.values()) < min(keys.index(k) for k in local_only), keys
-    # 值语义不变：本地 port 覆盖订阅 8888；订阅独有 mixed-port 保留
-    assert out['port'] == 7890 and out['mixed-port'] == 7893
-    print('[OK] 输出 key 顺序：按订阅配置顺序，本地独有 key 追加末尾')
+    assert list(out) == list(template), (list(out), list(template))
+    assert 'mixed-port' not in out
+    assert out['port'] == 7890 and out['dns']['enhanced-mode'] == 'fake-ip'
+    print('[OK] 输出 key 顺序：完全按本地配置')
 
 
 def test_build_minimal_config_is_local_only():
@@ -323,14 +341,19 @@ def test_build_minimal_config_is_local_only():
 
 def test_convert_no_sub_url_returns_minimal_config():
     """第 1 步无订阅地址：跳过拉取，直接由第 3 步生成最小配置并走第 4 步转换。"""
-    control = {'exclude_groups': [], 'remove_keys': [], 'cache_ttl': 3600}
+    control = {'cache_ttl': 3600}
     template = _load_template()
     text, userinfo = main.convert('', control, template)
     out = yaml.safe_load(text)
-    assert [p['name'] for p in out['proxies']] == ['Home']
+    assert merge.names_of(out['proxies']) == ['Home']
     assert userinfo == ''
-    assert '🏠 回家' in [g['name'] for g in out['proxy-groups']]
-    print('[OK] convert：sub_url 为空 → 最小配置文件')
+    assert '🏠 回家' in merge.names_of(out['proxy-groups'])
+    groups = {g['name']: g for g in out['proxy-groups']}
+    # 无机场节点时表达式展开为空，整组兜底 DIRECT（不得残留字面量 *）
+    assert groups['♻️ 自动选择']['proxies'] == ['DIRECT'], groups['♻️ 自动选择']
+    all_members = [m for g in out['proxy-groups'] for m in (g.get('proxies') or [])]
+    assert '*' not in all_members, all_members
+    print('[OK] convert：sub_url 为空 → 最小配置文件（表达式展开为空）')
 
 
 def test_convert_fetch_fail_no_cache_returns_minimal_config(monkeypatch):
@@ -338,11 +361,11 @@ def test_convert_fetch_fail_no_cache_returns_minimal_config(monkeypatch):
     main.remote_cache.clear()
     monkeypatch.setattr(main.requests, 'get',
                         lambda *a, **k: (_ for _ in ()).throw(Exception('network down')))
-    control = {'exclude_groups': [], 'remove_keys': [], 'cache_ttl': 3600}
+    control = {'cache_ttl': 3600}
     template = _load_template()
     text, userinfo = main.convert('http://fake', control, template)
     out = yaml.safe_load(text)
-    assert [p['name'] for p in out['proxies']] == ['Home']
+    assert merge.names_of(out['proxies']) == ['Home']
     assert userinfo == ''
     assert out['port'] == 7890
     print('[OK] convert：拉取失败且无缓存 → 最小配置文件')
@@ -354,16 +377,20 @@ def test_convert_fetch_fail_falls_back_to_cache(monkeypatch):
     main.remote_cache['http://fake'] = {
         'ts': time.time(),
         'data': {'proxies': [{'name': 'CACHED-HK', 'type': 'ss', 'server': '1.1.1.1', 'port': 1}],
-                 'rules': ['MATCH,DIRECT']},
+                 'rules': ['MATCH,DIRECT'],
+                 'dns': {'enable': True, 'nameserver': ['9.9.9.9']}},
         'userinfo': 'upload=8; download=88'}
     monkeypatch.setattr(main.requests, 'get',
                         lambda *a, **k: (_ for _ in ()).throw(Exception('network down')))
-    control = {'exclude_groups': [], 'remove_keys': [], 'cache_ttl': 3600}
+    control = {'cache_ttl': 3600}
     template = _load_template()
     text, userinfo = main.convert('http://fake', control, template)
     out = yaml.safe_load(text)
-    assert [p['name'] for p in out['proxies']] == ['CACHED-HK', 'Home']
+    assert merge.names_of(out['proxies']) == ['Home', 'CACHED-HK']
     assert userinfo == 'upload=8; download=88'
+    # 缓存里的机场规则与 dns 同样丢弃
+    assert not any(r == 'MATCH,DIRECT' for r in out['rules'])
+    assert out['dns']['nameserver'] != ['9.9.9.9']
     print('[OK] convert：拉取失败回退缓存 → 仍走合并')
 
 
@@ -372,21 +399,15 @@ def test_resolve_sub_url_by_index():
     control = {'sub_url': 'https://default',
                'sub_url1': 'https://one',
                'sub_url3': 'https://three'}
-    # 未传 / 空串 → 默认
     assert main.resolve_sub_url(None, control) == 'https://default'
     assert main.resolve_sub_url('', control) == 'https://default'
-    # 序号选择（允许首尾空白）
     assert main.resolve_sub_url('1', control) == 'https://one'
     assert main.resolve_sub_url('3', control) == 'https://three'
     assert main.resolve_sub_url(' 1 ', control) == 'https://one'
-    # sub_urlN 未配置 → 回退默认
     assert main.resolve_sub_url('2', control) == 'https://default'
-    # 越界 → 回退默认
     assert main.resolve_sub_url('0', control) == 'https://default'
     assert main.resolve_sub_url('9', control) == 'https://default'
-    # 直接传完整地址 → 原样使用（兼容旧用法）
     assert main.resolve_sub_url('https://raw.example/sub', control) == 'https://raw.example/sub'
-    # 默认也为空 → 空串（走最小配置）
     assert main.resolve_sub_url('3', {}) == ''
     print('[OK] resolve_sub_url：序号选择 / 回退 / 直传地址')
 
@@ -401,6 +422,23 @@ def test_sub_url_keys_are_control_keys():
     leaked = [k for k in main.SUB_URL_KEYS if k in template]
     assert not leaked, leaked
     print('[OK] 控制项：sub_url1~5 已从模板中剥离')
+
+
+def test_deprecated_control_keys_not_leaked(tmp_path):
+    """已废弃的 remove_keys / exclude_groups / merge_groups 仍须被剥离，不得泄漏进输出配置。"""
+    p = tmp_path / 'config.yaml'
+    p.write_text(
+        'password: pw\n'
+        'remove_keys:\n  - dns\n'
+        'exclude_groups:\n  - 🛑 全球拦截\n'
+        'merge_groups:\n  - target: A\n'
+        'port: 7890\n',
+        encoding='utf-8')
+    control, template = main.load_local_config(str(p))
+    for k in ('remove_keys', 'exclude_groups', 'merge_groups'):
+        assert k in control, k
+    assert template == {'port': 7890}, template
+    print('[OK] 控制项：已废弃的 remove_keys / exclude_groups / merge_groups 已剥离')
 
 
 def test_api_selects_subscription_by_index(monkeypatch):
@@ -431,21 +469,25 @@ def test_api_selects_subscription_by_index(monkeypatch):
 
 
 if __name__ == '__main__':
-    test_top_level_local_override_and_remote_keep()
-    test_proxies_merge_subscription_priority()
-    test_proxy_groups_subscription_priority()
-    test_exclude_groups()
-    test_remove_keys()
-    test_rules_local_first()
+    test_remote_top_level_keys_never_enter_output()
+    test_remote_content_groups_and_rules_discarded()
+    test_proxies_local_first_remote_appended()
+    test_proxy_groups_local_only_with_placeholder()
+    test_local_node_wins_over_remote_same_name()
+    test_placeholder_absent_appends_nodes_and_warns()
+    test_placeholder_in_top_level_proxies()
+    test_nodes_added_even_if_local_has_no_proxies_key()
+    test_empty_remote_expands_to_empty()
     test_empty_remote_returns_template()
     test_base64_fallback()
-    test_merge_groups_nodes_merged()
-    test_merge_groups_keep_sources()
-    test_output_key_order_follows_subscription()
+    test_find_dangling_rules()
+    test_find_dangling_members()
+    test_output_key_order_follows_local()
     test_build_minimal_config_is_local_only()
     test_convert_no_sub_url_returns_minimal_config()
     test_resolve_sub_url_by_index()
     test_sub_url_keys_are_control_keys()
     # 以下测试依赖 pytest 的 monkeypatch / requests mock，用 pytest 运行：
-    # test_full_convert_with_mock / test_fetch_remote_*
+    # test_full_convert_with_mock / test_fetch_remote_* / test_convert_fetch_fail_*
+    # test_deprecated_control_keys_not_leaked / test_api_selects_subscription_by_index
     print('\n全部基础测试通过 ✅')
