@@ -2,7 +2,7 @@
 # 以下为 subconverter 自身使用的配置，不会出现在输出的 Clash 配置中（合并前自动剥离）。
 api_path: /api          # clash 软件获取订阅的接口路径（修改需重启进程）
 password: 12345678      # 接口访问密码（clash 软件请求时需带上 ?password=xxx）
-sub_url: ""             # 机场订阅链接，可为空；为空时仅返回下方本地模板
+sub_url: ""             # 机场订阅链接，可为空；为空时根据下方本地配置生成最小配置文件
 basic_auth: ""          # 动态更新 Home 节点 IP/端口 的基础认证，格式 username:password（可选）
 server_url: ""          # 获取 Home 节点最新 IP/端口 的服务地址（可选，为空则不刷新）
 exclude_groups:         # 合并时排除的「代理组名 / 规则目标组名」
@@ -18,10 +18,10 @@ merge_groups:           # 指定代理组合并：把 sources 组的「节点」
   #     - 电报
   #   remove_sources: true    # 合并后删除源组（默认 true）
   #   redirect_rules: true    # 规则中指向源组的自动改指 target（默认 true，防止规则失效）
-cache_ttl: 3600         # 机场配置缓存时长（秒），0 表示不过期（进程内缓存，重启失效）
+cache_ttl: 0         # 拉取失败时可回退的缓存有效期（秒），0 表示永不过期（进程内缓存，重启失效）；机场配置每次请求都实时拉取
 
 # ===================== Clash 配置模板（本地配置作为模板） =====================
-# 下列内容即为 Clash 配置本体。合并策略：
+# 下列内容即为 Clash 配置本体，同时也是「订阅不可用时」的最小配置文件来源。合并策略：
 #   - proxies / proxy-groups：订阅（机场）同名项优先，本地仅补充机场没有的新项；
 #   - 其他顶层 key（port / mode / dns / tun / external-controller ...）：
 #     本地已有则用本地，本地没有且未在 remove_keys 中则用订阅的；

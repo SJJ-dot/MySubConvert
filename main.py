@@ -1,3 +1,12 @@
+"""MySubConvert —— 机场订阅转换服务。
+
+请求处理流程（与 convert() / load_subscription() 中的实现一一对应）：
+  1. 根据配置拉取机场订阅（sub_url 取自请求参数或 config.yaml，每次请求都实时拉取）；
+  2. 拉取失败时使用本地缓存（cache_ttl 有效期内的那一份）；
+  3. 缓存未命中时，根据本地配置生成最小配置文件（仅本地节点，不含机场内容）；
+  4. 根据本地配置转换订阅文件：补充本地节点、修正代理规则与代理组。
+"""
+
 from gevent import monkey
 
 monkey.patch_all()
@@ -126,39 +135,45 @@ def load_local_config(path=CONFIG_FILE):
     return control, template
 
 
-# ===================== 机场订阅拉取 + 缓存 =====================
+# ===================== 订阅获取：第 1 步拉取 → 第 2 步回退缓存 → 第 3 步最小配置 =====================
 remote_cache = {}  # sub_url -> {'ts': float, 'data': dict, 'userinfo': str}
+
+# 拉取订阅统一使用的请求头
+SUB_HEADER = {'Accept': '*/*', 'User-Agent': 'clash-verge/v2.4.7'}
 
 
 def fetch_remote(sub_url, ttl=0):
-    """拉取机场订阅，返回 (dict|None, userinfo)。
+    """流程第 1、2 步：拉取机场订阅，失败时回退本地缓存。返回 (dict|None, userinfo)。
 
-    - 命中未过期缓存直接返回；
-    - 拉取失败且有缓存则回退缓存；
-    - 拉取失败且无缓存返回 (None, '')，由调用方退化为本地模板。
+    网络优先：每次请求都实时拉取机场配置，缓存只作为失败时的回退。
+    - 第 1 步 拉取成功：写入缓存并返回最新配置与 userinfo；
+    - 第 2 步 拉取失败：回退缓存（仅当缓存仍在 cache_ttl 有效期内，ttl<=0 视为永不过期）；
+    - 缓存未命中（超出有效期或从未拉取过）：返回 (None, '')，由第 3 步生成最小配置文件。
     """
     now = time.time()
     cached = remote_cache.get(sub_url)
-    if cached and (ttl <= 0 or now - cached['ts'] < ttl):
-        return deepcopy(cached['data']), cached['userinfo']
+    usable = cached and (ttl <= 0 or now - cached['ts'] < ttl)
 
     try:
-        header = {'Accept': '*/*', 'User-Agent': 'clash-verge/v2.4.7'}
-        resp = requests.get(sub_url, headers=header, verify=False, timeout=(5, 50))
+        resp = requests.get(sub_url, headers=SUB_HEADER, verify=False, timeout=(5, 50))
         resp.encoding = 'utf-8'
-        logging.info("GET %s -> %s", sub_url, resp.status_code)
+        logging.info("第 1 步：拉取订阅 %s -> %s", sub_url, resp.status_code)
         if resp.status_code != 200:
             raise ValueError('意外的状态码 %s' % resp.status_code)
         userinfo = resp.headers.get('subscription-userinfo', '')
         data = merge.parse_clash(resp.text)
         remote_cache[sub_url] = {'ts': now, 'data': data, 'userinfo': userinfo}
-        logging.info("订阅解析成功: %s", sub_url)
+        logging.info("第 1 步：订阅解析成功，缓存已更新: %s", sub_url)
         return data, userinfo
     except Exception as e:
-        logging.error("拉取/解析订阅失败 %s: %s", sub_url, e)
-        if cached:
-            logging.info("使用缓存回退: %s", sub_url)
+        logging.error("第 1 步失败：拉取/解析订阅 %s: %s", sub_url, e)
+        if usable:
+            logging.info("第 2 步：回退缓存（距今 %d 秒）: %s", int(now - cached['ts']), sub_url)
             return deepcopy(cached['data']), cached['userinfo']
+        if cached:
+            logging.info("第 2 步：缓存已超出 cache_ttl=%s，不作为回退: %s", ttl, sub_url)
+        else:
+            logging.info("第 2 步：无本地缓存可回退: %s", sub_url)
         return None, ''
 
 
@@ -225,27 +240,60 @@ def refresh_proxy_ip_port(control):
         logging.error("刷新 Home IP 异常: %s", e)
 
 
-# ===================== 合并入口 =====================
-def convert(sub_url, control, template):
-    exclude = control.get('exclude_groups') or []
-    remove_keys = control.get('remove_keys') or []
-    merge_groups = control.get('merge_groups') or []
+# ===================== 流程第 3 步：生成最小配置文件 =====================
+def build_minimal_config(template):
+    """流程第 3 步：机场订阅与缓存都不可用时，根据本地配置生成最小配置文件。
 
+    本地模板本身就是最小可用配置：只含本地节点（Home）与本地代理组 / 规则，
+    不含任何机场内容，客户端仍能正常分流（本地规则生效，其余走直连）。
+    """
+    logging.info("第 3 步：订阅拉取失败且缓存未命中，根据本地配置生成最小配置文件")
+    return deepcopy(template)
+
+
+def load_subscription(sub_url, control, template):
+    """流程第 1-3 步：获取待转换的订阅配置，返回 (config, userinfo)。
+
+    :param sub_url: 机场订阅地址（为空则跳过前两步，直接生成最小配置文件）
+    :param control: 控制项配置（取 cache_ttl）
+    :param template: 本地配置模板（第 3 步据此生成最小配置文件）
+    :return: config 为第 1 步的机场订阅、第 2 步的缓存或第 3 步的最小配置；
+             userinfo 仅在第 1 步拿到实时流量信息时非空。
+    """
+    if not sub_url:
+        logging.info("未配置 sub_url，跳过订阅拉取")
+        return build_minimal_config(template), ''
+
+    ttl = int(control.get('cache_ttl', 0) or 0)
+    config, userinfo = fetch_remote(sub_url, ttl)   # 第 1 步 → 失败回退缓存（第 2 步）
+    if config is None:
+        return build_minimal_config(template), ''   # 第 3 步
+    return config, userinfo
+
+
+# ===================== 流程第 4 步：订阅文件转换（合并入口） =====================
+def convert(sub_url, control, template):
+    """流程第 4 步：根据本地配置转换订阅文件——补充本地节点、修正代理规则与代理组。
+
+    输入取自 load_subscription()（机场订阅 / 缓存 / 本地最小配置），
+    合并策略见 merge.merge_configs()：节点与代理组以订阅优先、本地补充，
+    本地规则置于最前，并按 exclude_groups / remove_keys / merge_groups 调整。
+    """
     apply_home_cache(template)
 
-    if not sub_url:
-        return yaml.dump(template, allow_unicode=True, sort_keys=False), ''
-
-    remote, userinfo = fetch_remote(sub_url, int(control.get('cache_ttl', 0) or 0))
-    if remote is None:
-        # 拉取失败且无缓存：退化为本地模板，保证服务可用
-        return yaml.dump(template, allow_unicode=True, sort_keys=False), ''
+    remote, userinfo = load_subscription(sub_url, control, template)
 
     merged = merge.merge_configs(
         template, remote,
-        exclude_groups=exclude,
-        remove_keys=remove_keys,
-        merge_groups=merge_groups,
+        exclude_groups=control.get('exclude_groups') or [],
+        remove_keys=control.get('remove_keys') or [],
+        merge_groups=control.get('merge_groups') or [],
+    )
+    logging.info(
+        "第 4 步：转换完成，节点 %d 个 / 代理组 %d 个 / 规则 %d 条",
+        len(merged.get('proxies') or []),
+        len(merged.get('proxy-groups') or []),
+        len(merged.get('rules') or []),
     )
     return yaml.dump(merged, allow_unicode=True, sort_keys=False), userinfo
 
@@ -275,6 +323,8 @@ def api():
     headers = {}
     if userinfo:
         headers['subscription-userinfo'] = userinfo
+    else:
+        logging.info("本次响应未携带 subscription-userinfo（客户端将保留上次显示值）")
     return Response(clash_yaml, mimetype='text/plain', headers=headers)
 
 

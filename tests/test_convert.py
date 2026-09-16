@@ -224,27 +224,52 @@ def test_fetch_remote_success(monkeypatch):
     print('[OK] fetch_remote：拉取成功、解析并缓存')
 
 
-def test_fetch_remote_cache_hit(monkeypatch):
+def test_fetch_remote_always_fetches_even_with_fresh_cache(monkeypatch):
+    """网络优先：即使缓存新鲜，也必须重新拉取机场配置。"""
     main.remote_cache['http://fake'] = {
-        'ts': time.time(), 'data': {'proxies': []}, 'userinfo': 'cached'}
-    # 命中缓存时不应发起网络请求
-    def _no_call(*a, **k):
-        raise AssertionError('命中缓存不应发起 requests.get')
-    monkeypatch.setattr(main.requests, 'get', _no_call)
-    data, ui = main.fetch_remote('http://fake', ttl=0)
-    assert data == {'proxies': []} and ui == 'cached'
-    print('[OK] fetch_remote：缓存命中（ttl=0 不过期）不发请求')
+        'ts': time.time(),
+        'data': {'proxies': [{'name': 'CACHED'}]},
+        'userinfo': 'cached'}
+    payload = yaml.safe_dump(
+        {'port': 7890, 'proxies': [{'name': 'FRESH', 'type': 'ss', 'server': '1.1.1.1', 'port': 1}]},
+        allow_unicode=True)
+    calls = []
+
+    def _fake_get(*args, **kwargs):
+        calls.append(kwargs)
+        return _FakeResp(200, payload, {'subscription-userinfo': 'upload=9'})
+
+    monkeypatch.setattr(main.requests, 'get', _fake_get)
+    data, ui = main.fetch_remote('http://fake', ttl=3600)
+    assert calls, '有新鲜缓存时仍应发起拉取'
+    assert data['proxies'][0]['name'] == 'FRESH'        # 用最新配置而非缓存
+    assert ui == 'upload=9'                             # userinfo 来自当次拉取
+    assert main.remote_cache['http://fake']['data']['proxies'][0]['name'] == 'FRESH'
+    print('[OK] fetch_remote：网络优先，新鲜缓存也重新拉取并更新缓存')
 
 
-def test_fetch_remote_fallback_cache(monkeypatch):
+def test_fetch_remote_fallback_fresh_cache(monkeypatch):
+    """拉取失败：回退仍在 cache_ttl 有效期内的缓存。"""
     main.remote_cache['http://fake'] = {
-        'ts': 0, 'data': {'proxies': []}, 'userinfo': 'cached'}
-    # 缓存过期（ts=0 且 ttl>0）→ 发起请求 → 失败 → 回退缓存
+        'ts': time.time(),
+        'data': {'proxies': [{'name': 'CACHED'}]},
+        'userinfo': 'cached'}
+    monkeypatch.setattr(main.requests, 'get',
+                        lambda *a, **k: (_ for _ in ()).throw(Exception('net down')))
+    data, ui = main.fetch_remote('http://fake', ttl=3600)
+    assert data == {'proxies': [{'name': 'CACHED'}]} and ui == 'cached'
+    print('[OK] fetch_remote：拉取失败回退有效期内的缓存')
+
+
+def test_fetch_remote_expired_cache_not_used(monkeypatch):
+    """拉取失败且缓存已超出 cache_ttl：不作回退，交由调用方退化为本地模板。"""
+    main.remote_cache['http://fake'] = {
+        'ts': 0, 'data': {'proxies': [{'name': 'STALE'}]}, 'userinfo': 'stale'}
     monkeypatch.setattr(main.requests, 'get',
                         lambda *a, **k: (_ for _ in ()).throw(Exception('network down')))
     data, ui = main.fetch_remote('http://fake', ttl=3600)
-    assert data == {'proxies': []} and ui == 'cached'
-    print('[OK] fetch_remote：拉取失败回退缓存')
+    assert data is None and ui == ''
+    print('[OK] fetch_remote：缓存超出 cache_ttl 时不回退，返回 (None, "")')
 
 
 def test_fetch_remote_fail_no_cache(monkeypatch):
@@ -281,6 +306,67 @@ def test_output_key_order_follows_subscription():
     print('[OK] 输出 key 顺序：按订阅配置顺序，本地独有 key 追加末尾')
 
 
+def test_build_minimal_config_is_local_only():
+    """第 3 步：最小配置文件只含本地节点与本地代理组 / 规则，不含机场内容。"""
+    template = _load_template()
+    minimal = main.build_minimal_config(template)
+    proxies = [p['name'] for p in minimal['proxies']]
+    groups = [g['name'] for g in minimal['proxy-groups']]
+    assert proxies == ['Home'], proxies
+    assert '🏠 回家' in groups and '🚀 节点选择' in groups
+    assert minimal['port'] == 7890
+    # 深拷贝：不得与模板共享可变对象
+    minimal['proxies'][0]['server'] = 'x'
+    assert template['proxies'][0]['server'] != 'x'
+    print('[OK] build_minimal_config：最小配置仅含本地节点')
+
+
+def test_convert_no_sub_url_returns_minimal_config():
+    """第 1 步无订阅地址：跳过拉取，直接由第 3 步生成最小配置并走第 4 步转换。"""
+    control = {'exclude_groups': [], 'remove_keys': [], 'cache_ttl': 3600}
+    template = _load_template()
+    text, userinfo = main.convert('', control, template)
+    out = yaml.safe_load(text)
+    assert [p['name'] for p in out['proxies']] == ['Home']
+    assert userinfo == ''
+    assert '🏠 回家' in [g['name'] for g in out['proxy-groups']]
+    print('[OK] convert：sub_url 为空 → 最小配置文件')
+
+
+def test_convert_fetch_fail_no_cache_returns_minimal_config(monkeypatch):
+    """第 1 步失败且第 2 步缓存未命中：退化为第 3 步的最小配置文件。"""
+    main.remote_cache.clear()
+    monkeypatch.setattr(main.requests, 'get',
+                        lambda *a, **k: (_ for _ in ()).throw(Exception('network down')))
+    control = {'exclude_groups': [], 'remove_keys': [], 'cache_ttl': 3600}
+    template = _load_template()
+    text, userinfo = main.convert('http://fake', control, template)
+    out = yaml.safe_load(text)
+    assert [p['name'] for p in out['proxies']] == ['Home']
+    assert userinfo == ''
+    assert out['port'] == 7890
+    print('[OK] convert：拉取失败且无缓存 → 最小配置文件')
+
+
+def test_convert_fetch_fail_falls_back_to_cache(monkeypatch):
+    """第 1 步失败但有有效缓存：用缓存内容走第 4 步转换，并透传缓存里的 userinfo。"""
+    main.remote_cache.clear()
+    main.remote_cache['http://fake'] = {
+        'ts': time.time(),
+        'data': {'proxies': [{'name': 'CACHED-HK', 'type': 'ss', 'server': '1.1.1.1', 'port': 1}],
+                 'rules': ['MATCH,DIRECT']},
+        'userinfo': 'upload=8; download=88'}
+    monkeypatch.setattr(main.requests, 'get',
+                        lambda *a, **k: (_ for _ in ()).throw(Exception('network down')))
+    control = {'exclude_groups': [], 'remove_keys': [], 'cache_ttl': 3600}
+    template = _load_template()
+    text, userinfo = main.convert('http://fake', control, template)
+    out = yaml.safe_load(text)
+    assert [p['name'] for p in out['proxies']] == ['CACHED-HK', 'Home']
+    assert userinfo == 'upload=8; download=88'
+    print('[OK] convert：拉取失败回退缓存 → 仍走合并')
+
+
 if __name__ == '__main__':
     test_top_level_local_override_and_remote_keep()
     test_proxies_merge_subscription_priority()
@@ -293,6 +379,8 @@ if __name__ == '__main__':
     test_merge_groups_nodes_merged()
     test_merge_groups_keep_sources()
     test_output_key_order_follows_subscription()
+    test_build_minimal_config_is_local_only()
+    test_convert_no_sub_url_returns_minimal_config()
     # 以下测试依赖 pytest 的 monkeypatch / requests mock，用 pytest 运行：
     # test_full_convert_with_mock / test_fetch_remote_*
     print('\n全部基础测试通过 ✅')
