@@ -2519,6 +2519,34 @@ def _ui_targets(template):
     return targets
 
 
+def _json_for_script(obj):
+    """把一个对象序列化成**可安全内联进 <script>** 的 JSON。
+
+    `json.dumps` 只保证 JSON 合法，**不保证 HTML 安全**：它不会转义 `<`。
+    而配置内容（规则串、节点名、订阅 URL…）是用户可控的，只要里面出现
+    `</script>`，浏览器就会提前闭合当前的 <script> 标签，后面的内容被当成
+    HTML 解析 —— 于是 `</script><script>...</script>` 就是**可执行的存储型 XSS**。
+    （实测：headless Edge 打开 /ui，注入的 `window.__PWNED = 1` 真的跑起来了。）
+
+    修法：把 `<` `>` `&` 以及行分隔符 U+2028/U+2029 转成 `\\uXXXX` 转义。
+    这些都是 **JSON 标准转义**，`JSON.parse` 出来的字符串与原文完全一致
+    （`\\u003c` 解析回来就是 `<`），所以前端逻辑零改动，只是 HTML 解析器
+    再也看不到 `</script>` 了。
+
+    **只替换这几个字符本身，绝对不能动反斜杠**：JSON 文本里的 `\\n` 已经是
+    合法转义，若再整体转义一遍反斜杠，`\\n` 会变成 `\\\\n` —— 换行符变成
+    字面量「反斜杠+n」两个字符，配置内容就被改坏了。
+
+    注意 U+2028/U+2029 也要转：它们在 JS 里是**行终止符**，直接出现在字符串
+    字面量里会导致语法错误（JSON 允许，JS 不允许）——会让整页白屏。
+    """
+    s = json.dumps(obj, ensure_ascii=False)
+    for ch, esc in (('<', '\\u003c'), ('>', '\\u003e'), ('&', '\\u0026'),
+                    ('\u2028', '\\u2028'), ('\u2029', '\\u2029')):
+        s = s.replace(ch, esc)
+    return s
+
+
 @app.route('/ui')
 def ui():
     need = ui_login_required()
@@ -2544,8 +2572,8 @@ def ui():
         'mtime': time.strftime('%Y-%m-%d %H:%M:%S',
                                time.localtime(os.path.getmtime(CONFIG_FILE))),
     }
-    html = UI_HEAD.replace('__FIELDS__', json.dumps(meta, ensure_ascii=False))
-    html = html.replace('__RAW__', json.dumps(ui_blocks_payload(text), ensure_ascii=False))
+    html = UI_HEAD.replace('__FIELDS__', _json_for_script(meta))
+    html = html.replace('__RAW__', _json_for_script(ui_blocks_payload(text)))
     return Response(html, mimetype='text/html')
 
 

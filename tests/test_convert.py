@@ -1654,6 +1654,64 @@ def test_ui_page_inline_js_is_valid(tmp_path, monkeypatch):
     print('[OK] /ui 内联 JS 语法正确')
 
 
+def test_ui_page_xss_escaped(tmp_path, monkeypatch):
+    """配置内容里出现 `</script>` 时不能逃出内联 <script>（存储型 XSS）。
+
+    真实漏洞：/ui 把 config.yaml 的内容 `json.dumps` 后直接 replace 进
+    `<script>`，**`json.dumps` 只保证 JSON 合法、不保证 HTML 安全**——它不转义 `<`。
+    于是只要配置里出现 `</script><script>...</script>`，浏览器就会提前闭合
+    当前 script 标签，注入的脚本**真的会执行**。
+    （实测：headless Edge 打开 /ui，`window.__PWNED` 变成 1。）
+
+    修法见 `_json_for_script`：把 `<` `>` `&` 与 U+2028/U+2029 转成 `\\uXXXX`。
+    这些是合法的 JSON 转义，`JSON.parse` 后与原文完全一致，前端零改动。
+
+    这条测试守两点，缺一不可：
+      1. **安全**：页面里不应出现配置带来的裸 `</script>`；
+      2. **不破坏功能**：转义后 `JSON.parse` 出来的内容必须与原文逐字相同
+         （尤其换行 —— 若误把反斜杠也转义一遍，`\\n` 会变成字面量「反斜杠+n」）。
+    """
+    import json
+    import re
+
+    # 规则里塞 </script> 与 <img onerror>，节点名里塞 img 注入
+    evil_rule = 'DOMAIN-SUFFIX,evil.com,PROXY # </script><script>window.__PWNED=1</script>'
+    cfg = tmp_path / 'config.yaml'
+    cfg.write_text(
+        'password: old-pw\n'
+        'sub_url: https://example.com/sub\n'
+        'rules:\n'
+        '  - ' + evil_rule + '\n'
+        '  - MATCH,DIRECT\n'
+        'proxy-groups:\n'
+        '  - name: PROXY\n'
+        '    type: select\n'
+        '    proxies:\n'
+        '      - DIRECT\n',
+        encoding='utf-8')
+    client = ui_client(cfg, monkeypatch)
+    html = ui_page_html()
+
+    # ---- 1. 安全：只应有页面自己的 script 闭合标签 ----
+    n_close = html.count('</script>')
+    assert n_close == 2, \
+        '页面出现 %d 个 </script>（正常 2：登录无关，页面自身两个 script 块）—— ' \
+        '配置内容逃出了 <script>，构成存储型 XSS' % n_close
+    assert '</script><script>' not in html, '注入序列原样出现，可被浏览器执行'
+    assert '\\u003c' in html, '未做 < 转义，_json_for_script 可能没接上'
+
+    # ---- 2. 不破坏功能：注入的 JSON 解析后必须与配置原文一致 ----
+    m = re.search(r'const F = (.*?), RAW = (.*?);', html, re.S)
+    assert m, '未找到字段注入语句'
+    raw = json.loads(m.group(2))
+    assert evil_rule in raw['rules'], \
+        '转义破坏了内容：rules 里读不回原始规则\n%r' % raw['rules'][:200]
+    # 换行必须是真实换行（防止 \\n 被二次转义成字面量）
+    assert '\n' in raw['rules'] and '\\n' not in raw['rules'].replace('\n', ''), \
+        'rules 里的换行被改坏了（疑似把反斜杠也转义了一遍）'
+    print('[OK] /ui：配置内容里的 </script> 已被转义，且内容往返无损')
+
+
 def test_ui_page_renders_fields(tmp_path, monkeypatch):
     """页面必须把槽位表、目标候选与原始内容注入成可用的 JS 字面量。"""
     import json
