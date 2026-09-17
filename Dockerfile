@@ -1,5 +1,5 @@
 # 使用官方的 Python 镜像
-FROM python:3.9-slim
+FROM python:3.12-slim
 
 # 设置时区为东八区（北京时间）
 ENV TZ=Asia/Shanghai
