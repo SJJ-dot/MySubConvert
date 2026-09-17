@@ -1,16 +1,19 @@
 # ===================== 服务控制配置 =====================
 # 以下为 subconverter 自身使用的配置，不会出现在输出的 Clash 配置中（合并前自动剥离）。
+# 可直接访问 http://<本机>:5000/ui 在网页上编辑本文件（保存即热重载，无需重启）。
 api_path: /api          # clash 软件获取订阅的接口路径（修改需重启进程）
 password: 12345678      # 接口访问密码（clash 软件请求时需带上 ?password=xxx）
-sub_url: ""             # 默认机场订阅链接，可为空；为空时根据下方本地配置生成最小配置文件
-sub_url1: ""            # 备用订阅 1：客户端请求 ?sub_url=1 时使用（为空则回退 sub_url）
-sub_url2: ""            # 备用订阅 2：?sub_url=2
-sub_url3: ""            # 备用订阅 3：?sub_url=3
-sub_url4: ""            # 备用订阅 4：?sub_url=4
-sub_url5: ""            # 备用订阅 5：?sub_url=5
+sub_url: https://a.c/subscribe1 # 默认机场订阅链接，可为空；为空时根据下方本地配置生成最小配置文件
+sub_url1: https://a.c/subscribe2 # 备用订阅 1：客户端请求 ?sub_url=1 时使用（为空则回退 sub_url）
+sub_url2: "" # 备用订阅 2：?sub_url=2
+sub_url3: "" # 备用订阅 3：?sub_url=3
+sub_url4: "" # 备用订阅 4：?sub_url=4
+sub_url5: "" # 备用订阅 5：?sub_url=5
 basic_auth: ""          # 动态更新 Home 节点 IP/端口 的基础认证，格式 username:password（可选）
 server_url: ""          # 获取 Home 节点最新 IP/端口 的服务地址（可选，为空则不刷新）
-cache_ttl: 0            # 拉取失败时可回退的缓存有效期（秒），0 表示永不过期（进程内缓存，重启失效）；机场配置每次请求都实时拉取
+cache_ttl: 60           # 缓存重新加载间隔（秒）：上次加载距今小于该值就直接用缓存，超过则触发重新加载
+                        # 注意缓存本身「成功写入后永不过期」（并落盘到 sub_cache.json，重启不丢）；
+                        # 本项只控制「多久去机场取一次」。请求触发加载后最多等 3 秒，超时用旧缓存返回。
 
 # ===================== Clash 配置（本地为准，机场只提供代理节点） =====================
 # 通用项（port / dns / keep-alive-interval 等）取自机场官方 Clash 配置（2026-09-16 拉取），
@@ -174,10 +177,8 @@ dns:
   # DNS，起不到「国外 DNS 交叉验证防污染」的作用；mihomo 现已推荐用 proxy-server-nameserver +
   # nameserver-policy 替代，故本模板不启用。另：魔戒的 dns.ipv6: true 与本文件顶层 ipv6: false
   # 冲突，两者需保持一致，此处跟随顶层保持不返回 AAAA。
-
 experimental:
   ignore-resolve-fail: true   # DNS 解析失败时忽略，避免因解析失败直接断连（本地补充）
-
 hosts:                        # 强制指定解析结果（不改变 DNS 行为，仅本机生效；本地补充）
   'mtalk.google.com': 108.177.125.188
   'services.googleapis.cn': 74.125.203.94
@@ -187,7 +188,7 @@ hosts:                        # 强制指定解析结果（不改变 DNS 行为�
 
 # --------------------- 代理节点（本地节点；机场节点由 "*" 表达式插入） ---------------------
 proxies:
-  - name: Home                # 占位值；配置 server_url 后每次请求都会刷新为最新 IP / 端口
+  - name: Home   # 占位值；配置 server_url 后每次请求都会刷新为最新 IP / 端口
     type: ss
     server: 11.11.11.11
     port: 11
@@ -198,37 +199,38 @@ proxies:
 # --------------------- 代理组（全部本地定义，机场的组一律丢弃） ---------------------
 # 书写顺序 = 客户端 UI 里的显示顺序。"*" 展开为机场带来的全部节点（本地节点不参与展开）。
 proxy-groups:
-  - name: 🚀 节点选择          # 手动挑选：机场节点 + 自动选择
+  - name: 🚀 节点选择   # 手动挑选：机场节点 + 自动选择
     type: select
     proxies:
       - ♻️ 自动选择
       - "*"
-  - name: ♻️ 自动选择          # 自动选延迟最低的机场节点
+  - name: ♻️ 自动选择   # 自动选延迟最低的机场节点
     type: url-test
-    url: http://www.google-analytics.com/generate_204   # 探测地址（同机场）
-    interval: 300             # 探测间隔（秒）
-    tolerance: 50             # 延迟差在此范围内不切换，避免抖动
     proxies:
       - "*"
+    url: http://www.google-analytics.com/generate_204   # 探测地址（同机场）
+    interval: 300   # 探测间隔（秒）
+    tolerance: 50   # 延迟差在此范围内不切换，避免抖动
   - name: 🎯 全球直连
     type: select
     proxies:
       - DIRECT
       - 🚀 节点选择
       - ♻️ 自动选择
-  - name: 🐟 漏网之鱼          # 兜底：未命中任何规则的流量
+  - name: 🐟 漏网之鱼   # 兜底：未命中任何规则的流量
     type: select
     proxies:
       - 🚀 节点选择
       - ♻️ 自动选择
       - DIRECT
-  - name: 🏠 回家              # 回家 / 内网：默认走 Home 本地节点
+  - name: 🏠 回家   # 回家 / 内网：默认走 Home 本地节点
     type: select
     proxies:
       - Home
+      - 内网
       - 🚀 节点选择
       - DIRECT
-  - name: 🤖 GITHUB            # GitHub 相关域名
+  - name: 🤖 Github   # GitHub 相关域名
     type: select
     proxies:
       - 🚀 节点选择
@@ -248,10 +250,14 @@ proxy-groups:
 # --------------------- 规则（全部本地定义，机场的规则一律丢弃） ---------------------
 # 规则自上而下匹配，首条命中生效；最后必须有一条 MATCH 兜底。
 rules:
-  - DOMAIN-SUFFIX,githubcopilot.com,🤖 GITHUB
-  - DOMAIN-SUFFIX,github.com,🤖 GITHUB
-  - DOMAIN-SUFFIX,githubassets.com,🤖 GITHUB
-  - DOMAIN-SUFFIX,githubusercontent.com,🤖 GITHUB
-  - IP-CIDR,192.168.80.0/24,🏠 回家
-  - DOMAIN-SUFFIX,nx56.top,🏠 回家
+  - DOMAIN-SUFFIX,githubcopilot.com,🤖 Github
+  - DOMAIN-SUFFIX,github.com,🤖 Github
+  - DOMAIN-SUFFIX,githubassets.com,🤖 Github
+  - DOMAIN-SUFFIX,githubusercontent.com,🤖 Github
+  - GEOSITE,CN,DIRECT
+  - GEOIP,CN,DIRECT
+  - GEOIP,HK,DIRECT
+  - GEOIP,LAN,DIRECT
   - MATCH,🐟 漏网之鱼
+
+

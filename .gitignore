@@ -1,1 +1,20 @@
 /template.yaml
+
+# 运行时产物：订阅缓存（含机场节点信息，勿提交）
+/sub_cache.json
+/sub_cache.json.tmp
+/home_cache.yaml
+
+# 网页界面保存配置时生成的备份
+/config.yaml.bak
+
+# 配置热重载写入时的临时文件
+/config.yaml.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# WorkBuddy 工作区（本地记忆/技能，不进仓库）
+/.workbuddy/
