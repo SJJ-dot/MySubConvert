@@ -694,12 +694,18 @@ UI_LOGIN_HEAD = """<!DOCTYPE html>
 <body>
 <form class="box" method="post" action="/ui/login">
   <h1>MySubConvert 配置</h1>
-  <label for="pw">访问密码</label>
-  <input type="password" id="pw" name="password" autocomplete="current-password" autofocus>
+  <!-- 用户名只为了满足浏览器的「保存密码」启发式：没有 username 字段时
+       Chrome/Edge 不会弹出保存密码提示，也不会自动填充。
+       这里**不做任何校验**，值被后端直接忽略。 -->
+  <label for="un">用户名</label>
+  <input type="text" id="un" name="username" autocomplete="username"
+         placeholder="任意填写，不校验" autofocus>
+  <label for="pw" style="margin-top:14px">访问密码</label>
+  <input type="password" id="pw" name="password" autocomplete="current-password">
   <input type="hidden" name="next" value="__NEXT__">
   <button type="submit">登录</button>
   <div id="err">__ERR__</div>
-  <p class="hint">密码即 config.yaml 中的 password（与订阅接口相同）。</p>
+  <p class="hint">用户名任意填写、不做校验；密码即 config.yaml 中的 password（与订阅接口相同）。</p>
 </form>
 </body>
 </html>

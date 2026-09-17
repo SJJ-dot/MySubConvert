@@ -3,6 +3,7 @@
 空 sub_url、多订阅地址等场景。"""
 import copy
 import os
+import re
 import sys
 import tempfile
 import time
@@ -672,6 +673,49 @@ def test_ui_login_redirects_and_logout(tmp_path, monkeypatch):
     client.get('/ui/logout')
     assert client.get('/ui').status_code == 302
     print('[OK] 登录跳转限站内；登出后失效')
+
+
+def test_ui_login_form_has_username_field(tmp_path, monkeypatch):
+    """登录页必须带一个 username 输入框（浏览器保存密码的启发式前提）。
+
+    背景：没有 username 字段时 Chrome/Edge 不会弹「保存密码」，也不会自动填充。
+    该字段**不做任何校验**，纯粹为了满足浏览器的表单识别条件。
+    """
+    cfg = tmp_path / 'config.yaml'
+    cfg.write_text(_UI_SAMPLE, encoding='utf-8')
+    monkeypatch.setattr(main, 'CONFIG_FILE', str(cfg))
+    monkeypatch.setattr(main.load_local_config, '__defaults__', (str(cfg),))
+    main.invalidate_config()
+    html = main.app.test_client().get('/ui/login').get_data(as_text=True)
+
+    # 浏览器识别一组账密表单所需的最低条件
+    assert re.search(r'<input[^>]*name="username"', html), '缺少 username 输入框'
+    assert 'autocomplete="username"' in html, 'username 缺少 autocomplete 提示'
+    assert re.search(r'<input[^>]*name="password"', html), '缺少 password 输入框'
+    assert 'autocomplete="current-password"' in html
+
+    # 用户名不校验：随便填 + 正确密码即可登录
+    c = main.app.test_client()
+    r = c.post('/ui/login', data={'username': 'whatever-任意值',
+                                  'password': _UI_SAMPLE_PW, 'next': '/ui'})
+    assert r.status_code == 302, r.status_code
+    assert main.UI_SESSION_COOKIE in r.headers.get('Set-Cookie', '')
+    assert c.get('/ui').status_code == 200
+
+    # 不带用户名（老书签 / 脚本）必须继续可用 —— 向后兼容
+    c2 = main.app.test_client()
+    assert c2.post('/ui/login',
+                   data={'password': _UI_SAMPLE_PW}).status_code == 302
+
+    # 「不校验」不等于可绕过：密码必须仍然是对的
+    c3 = main.app.test_client()
+    assert c3.post('/ui/login', data={'username': 'admin',
+                                      'password': 'wrong'}).status_code == 403
+    # 把正确密码填进用户名框、密码框留空 —— 不得放行
+    c4 = main.app.test_client()
+    assert c4.post('/ui/login', data={'username': _UI_SAMPLE_PW,
+                                      'password': ''}).status_code == 403
+    print('[OK] 登录页有 username 框且不校验；密码校验不受影响')
 
 
 def test_ui_password_change_takes_effect(tmp_path, monkeypatch):
