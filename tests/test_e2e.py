@@ -94,7 +94,8 @@ def e2e_app(airport, tmp_path, monkeypatch):
     text = open(src, encoding='utf-8').read()
     text = main.assemble_config(text, {
         'sub_url': airport['url'],
-        'password': 'e2e-pass',
+        # 只写哈希：**配置里从来不落明文口令**
+        'password_hash': main.hash_password('e2e-pass', iterations=1000),
         'cache_ttl': '60',
     })
     cfg.write_text(text, encoding='utf-8')
@@ -201,7 +202,7 @@ def test_e2e_minimal_config_when_sub_url_unconfigured(tmp_path, monkeypatch):
                        'config.yaml')
     text = main.assemble_config(open(src, encoding='utf-8').read(), {
         'sub_url': '""',
-        'password': 'e2e-pass',
+        'password_hash': main.hash_password('e2e-pass', iterations=1000),
     })
     cfg.write_text(text, encoding='utf-8')
 

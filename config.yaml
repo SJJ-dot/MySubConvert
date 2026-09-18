@@ -2,7 +2,10 @@
 # 以下为 subconverter 自身使用的配置，不会出现在输出的 Clash 配置中（合并前自动剥离）。
 # 可直接访问 http://<本机>:5000/ui 在网页上编辑本文件（保存即热重载，无需重启）。
 api_path: /api          # clash 软件获取订阅的接口路径（修改需重启进程）
-password: 12345678      # 接口访问密码（clash 软件请求时需带上 ?password=xxx）
+# 访问密码：**只存哈希，不要填明文**。默认为空 = 未设置密码，
+# 此时订阅接口一律拒绝；打开 /ui 在「访问密码」卡片里设置即可（也可再次清空）。
+# 旧配置里若还留着明文 `password: xxx`，首次加载会自动改写成下面这行的哈希形式。
+password_hash:
 sub_url: https://a.c/subscribe1 # 默认机场订阅链接，可为空；为空时根据下方本地配置生成最小配置文件
 sub_url1: https://a.c/subscribe2 # 备用订阅 1：客户端请求 ?sub_url=1 时使用（为空则回退 sub_url）
 sub_url2: "" # 备用订阅 2：?sub_url=2
@@ -230,34 +233,9 @@ proxy-groups:
       - 内网
       - 🚀 节点选择
       - DIRECT
-  - name: 🤖 Github   # GitHub 相关域名
-    type: select
-    proxies:
-      - 🚀 节点选择
-      - ♻️ 自动选择
-      - DIRECT
-  # 需要更多分流组时，按上面的写法在本地补充即可。
-  # 魔戒用的组名可作参考：ChatGPT / Gemini / Netflix / Telegram / TikTok / Twitter /
-  # WhatsApp / 哔哩哔哩 / 抖音 / 磁力下载 / 微软服务 / 苹果服务 / 谷歌服务 / Steam / Copilot。
-  # 例（取消注释即生效，注意同时补一条指向该组的规则）：
-  # - name: Netflix
-  #   type: select
-  #   proxies:
-  #     - 🚀 节点选择
-  #     - ♻️ 自动选择
-  #     - 🎯 全球直连
-
-# --------------------- 规则（全部本地定义，机场的规则一律丢弃） ---------------------
-# 规则自上而下匹配，首条命中生效；最后必须有一条 MATCH 兜底。
 rules:
-  - DOMAIN-SUFFIX,githubcopilot.com,🤖 Github
-  - DOMAIN-SUFFIX,github.com,🤖 Github
-  - DOMAIN-SUFFIX,githubassets.com,🤖 Github
-  - DOMAIN-SUFFIX,githubusercontent.com,🤖 Github
   - GEOSITE,CN,DIRECT
   - GEOIP,CN,DIRECT
   - GEOIP,HK,DIRECT
   - GEOIP,LAN,DIRECT
   - MATCH,🐟 漏网之鱼
-
-

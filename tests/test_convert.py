@@ -1,6 +1,7 @@
 """合并逻辑测试：覆盖「本地配置为准」的模型（除代理节点外只使用本地配置、
 表达式 `*` 展开、顶层 key 与顺序完全取自本地）、缓存优先 + 后台加载、
 空 sub_url、多订阅地址等场景。"""
+import base64
 import copy
 import os
 import re
@@ -569,10 +570,16 @@ def test_api_selects_subscription_by_index(monkeypatch):
 
 
 # ===================== 网页配置界面：文本块读写 =====================
+# _UI_SAMPLE 里的界面密码，测试登录用
+_UI_SAMPLE_PW = 'old-pw'
+# 配置里**只存哈希**（真实环境是 20 万次迭代，测试里降到 1000 次省时间；
+# 迭代次数写在哈希串里，verify_password 会照着它算）
+_UI_SAMPLE_HASH = main.hash_password(_UI_SAMPLE_PW, iterations=1000)
+
 _UI_SAMPLE = (
     '# 文件头注释\n'
     '\n'
-    'password: old-pw          # 访问密码\n'
+    'password_hash: %s          # 访问密码\n'
     'cache_ttl: 60\n'
     'port: 7890\n'
     'sub_url: https://example.com/sub   # 默认订阅\n'
@@ -588,9 +595,7 @@ _UI_SAMPLE = (
     'rules:\n'
     '  - DOMAIN-SUFFIX,example.com,G1   # 走代理\n'
     '  - MATCH,DIRECT\n'
-)
-# _UI_SAMPLE 里的界面密码，测试登录用
-_UI_SAMPLE_PW = 'old-pw'
+) % _UI_SAMPLE_HASH
 
 
 def ui_login(client, password=None):
@@ -616,13 +621,10 @@ def ui_client(cfg_path, monkeypatch, password=None):
 def ui_page_html():
     """取一份已登录的 /ui 页面 HTML（供纯前端逻辑测试用，不关心配置内容）。
 
-    这里依赖当前生效的配置（可能是 monkeypatch 后的临时配置），
-    密码从该配置里现读，避免写死某个样例口令。
+    依赖当前生效的配置（可能是 monkeypatch 后的临时配置），用样例口令登录。
     """
     client = main.app.test_client()
-    pod = main._ui_password()
-    assert pod, '当前配置没有 password，无法登录'
-    ui_login(client, pod)
+    ui_login(client)
     return client.get('/ui').get_data(as_text=True)
 
 
@@ -719,32 +721,224 @@ def test_ui_login_form_has_username_field(tmp_path, monkeypatch):
 
 
 def test_ui_password_change_takes_effect(tmp_path, monkeypatch):
-    """改掉 config.yaml 的 password 后，旧密码立即失效、新密码可用（热重载）。"""
+    """在界面里改密码：旧密码立即失效、新密码可用，且配置里只剩哈希。"""
     cfg = tmp_path / 'config.yaml'
     cfg.write_text(_UI_SAMPLE, encoding='utf-8')
     client = ui_client(cfg, monkeypatch)
     assert client.get('/ui').status_code == 200
 
-    cfg.write_text(main.assemble_config(
-        cfg.read_text(encoding='utf-8'), {'password': 'new-pw'}),
-        encoding='utf-8')
-    main.invalidate_config()
+    r = client.post('/ui/password', json={'old_password': _UI_SAMPLE_PW,
+                                          'new_password': 'new-pw-long-enough'})
+    assert r.get_json()['ok'] is True, r.get_json()
+
+    # 明文口令不该出现在配置文件的任何角落（含 .bak）
+    text = cfg.read_text(encoding='utf-8')
+    assert _UI_SAMPLE_PW not in text and 'new-pw-long-enough' not in text, text
+    parsed = yaml.safe_load(text)
+    assert parsed['password_hash'] != _UI_SAMPLE_HASH
+    assert 'password' not in parsed, '旧的明文 password 行必须被删干净'
+    assert '# 访问密码' in text                      # 写回不能吃掉行尾注释
 
     fresh = main.app.test_client()
     assert fresh.post('/ui/login', data={'password': _UI_SAMPLE_PW}).status_code == 403
-    assert fresh.post('/ui/login', data={'password': 'new-pw'}).status_code == 302
-    print('[OK] 改密码后旧密码失效、新密码生效（无需重启）')
+    assert fresh.post('/ui/login',
+                      data={'password': 'new-pw-long-enough'}).status_code == 302
+    print('[OK] 界面改密码：旧密码失效、新密码生效，配置里只有哈希')
+
+
+def test_password_hash_is_salted_and_verifiable():
+    """哈希必须加盐且不可逆推：同口令两次不同，串里没有明文。
+
+    salt 随机的意义在于「拖库后也凑不出彩虹表」——如果两个用户的口令相同、
+    导出串也一模一样，就等于把谁用了弱口令直接写在脸上了。
+    """
+    pw = 'correct horse battery staple'
+    a = main.hash_password(pw, iterations=1000)
+    b = main.hash_password(pw, iterations=1000)
+    assert a != b, 'salt 必须随机：同一口令两次导出的哈希不该相同'
+    assert pw not in a, '哈希串里不该出现明文'
+    assert a.startswith('pbkdf2_sha256$1000$')
+    assert main.verify_password(pw, a)
+    assert main.verify_password(pw, b)
+    assert not main.verify_password('wrong', a)
+    assert not main.verify_password('', a)
+    # 未设置密码 / 空串存储值：一律拒绝，不能被 `?password=` 空值绕过
+    assert not main.verify_password('', '')
+    assert not main.verify_password('x', '')
+    assert not main.verify_password('x', 'garbage')
+
+    # 摘要被改坏 → 校验失败
+    algo, iters, salt, _digest = a.split('$', 3)
+    tampered = '%s$%s$%s$%s' % (algo, iters, salt,
+                                base64.b64encode(b'\x00' * 32).decode('ascii'))
+    assert not main.verify_password(pw, tampered)
+    print('[OK] 口令哈希：加盐随机、无明文、摘要被改即失效')
+
+
+def test_legacy_plaintext_password_upgrades_to_hash(tmp_path, monkeypatch):
+    """旧配置里的明文 password：加载时就地改写成哈希，明文不再落盘。"""
+    cfg = tmp_path / 'config.yaml'
+    cfg.write_text('password: legacy-pw          # 老的明文写法\n'
+                   'sub_url: https://example.com/sub\n'
+                   'proxies:\n'
+                   '  - name: Home\n'
+                   '    password: 1234\n'      # 节点的口令是节点自己的，不能动
+                   , encoding='utf-8')
+    monkeypatch.setattr(main, 'CONFIG_FILE', str(cfg))
+    monkeypatch.setattr(main.load_local_config, '__defaults__', (str(cfg),))
+    main.invalidate_config()
+
+    control, _ = main.load_local_config()
+    assert main.stored_password(control).startswith('pbkdf2_sha256$')
+
+    text = cfg.read_text(encoding='utf-8')
+    assert 'legacy-pw' not in text, '明文口令还留在配置文件里'
+    assert 'password_hash:' in text
+    assert '# 老的明文写法' in text            # 行尾注释保留
+    assert 'password: 1234' in text            # 节点自己的口令原样保留
+
+    # 迁移后旧口令照样能用，不必重启
+    client = main.app.test_client()
+    assert client.post('/ui/login', data={'password': 'legacy-pw'}).status_code == 302
+    print('[OK] 明文 password 自动升级为哈希：旧口令仍有效，节点口令不受影响')
+
+
+def test_no_password_state(tmp_path, monkeypatch):
+    """默认值（未设密码）：界面可进以便设置，订阅接口一律拒绝。"""
+    cfg = tmp_path / 'config.yaml'
+    cfg.write_text('sub_url: ""\n'
+                   'proxies:\n'
+                   '  - name: Home\n'
+                   '    type: ss\n', encoding='utf-8')
+    monkeypatch.setattr(main, 'CONFIG_FILE', str(cfg))
+    monkeypatch.setattr(main.load_local_config, '__defaults__', (str(cfg),))
+    main.invalidate_config()
+    client = main.app.test_client()
+
+    # 界面不需要登录就能打开（否则第一次部署的人连设置密码的入口都没有）
+    html = client.get('/ui').get_data(as_text=True)
+    assert 'MySubConvert 配置' in html
+    # 订阅接口不能因为「没密码」就放行
+    assert client.get(main.API_PATH).get_data(as_text=True) == 'Hello World!'
+    assert client.get(main.API_PATH,
+                      query_string={'password': 'anything'}).get_data(
+                          as_text=True) == 'Hello World!'
+
+    # 设上密码后立刻要登录了，接口也认新密码
+    assert client.post('/ui/password',
+                       json={'new_password': 'brand-new-pw'}).get_json()['ok'] is True
+    assert client.get('/ui').status_code == 200          # 本页已续期
+    assert main.app.test_client().get('/ui').status_code == 302
+    print('[OK] 默认无密码：界面可进、接口全拒；设上密码后转为需登录')
+
+
+def test_ui_change_password_rejects_bad_input(tmp_path, monkeypatch):
+    """改密码接口的几道闸：原密码错、新密码太短。"""
+    cfg = tmp_path / 'config.yaml'
+    cfg.write_text(_UI_SAMPLE, encoding='utf-8')
+    client = ui_client(cfg, monkeypatch)
+
+    r = client.post('/ui/password', json={'old_password': 'wrong-one',
+                                          'new_password': 'another-pw123'})
+    assert r.status_code == 403 and r.get_json()['ok'] is False
+    r = client.post('/ui/password', json={'old_password': _UI_SAMPLE_PW,
+                                          'new_password': 'short'})
+    j = r.get_json()
+    assert j['ok'] is False and '8 位' in j['error'], j
+    # 被拒的两次都没改到配置
+    assert yaml.safe_load(cfg.read_text(encoding='utf-8'))['password_hash'] \
+        == _UI_SAMPLE_HASH
+    print('[OK] 改密码接口：原密码错 / 新密码太短都会被拒，配置不动')
+
+
+def test_password_change_kicks_other_sessions(tmp_path, monkeypatch):
+    """改完密码，之前登录的会话必须失效（当前会话自动续期）。"""
+    cfg = tmp_path / 'config.yaml'
+    cfg.write_text(_UI_SAMPLE, encoding='utf-8')
+    monkeypatch.setattr(main, 'CONFIG_FILE', str(cfg))
+    monkeypatch.setattr(main.load_local_config, '__defaults__', (str(cfg),))
+    main.invalidate_config()
+
+    me = ui_login(main.app.test_client())
+    other = ui_login(main.app.test_client())
+    assert other.get('/ui').status_code == 200
+
+    r = me.post('/ui/password', json={'old_password': _UI_SAMPLE_PW,
+                                      'new_password': 'rotated-pw-2026'})
+    assert r.get_json()['ok'] is True, r.get_json()
+    assert main.UI_SESSION_COOKIE in r.headers.get('Set-Cookie', ''), \
+        '改完密码要给当前会话补一枚新 cookie'
+
+    assert other.get('/ui').status_code == 302     # 别人的会话被踢下线
+    assert me.get('/ui').status_code == 200        # 我这个继续可用
+    print('[OK] 改密码后其他会话失效，当前会话自动续期')
+
+
+def test_clear_password_returns_to_default(tmp_path, monkeypatch):
+    """把新密码留空 = 清空密码，回到「未设置」的默认状态。"""
+    cfg = tmp_path / 'config.yaml'
+    cfg.write_text(_UI_SAMPLE, encoding='utf-8')
+    client = ui_client(cfg, monkeypatch)
+
+    r = client.post('/ui/password', json={'old_password': _UI_SAMPLE_PW,
+                                          'new_password': ''})
+    j = r.get_json()
+    assert j['ok'] is True and j.get('cleared') is True, j
+    assert yaml.safe_load(cfg.read_text(encoding='utf-8'))['password_hash'] == ''
+
+    main.invalidate_config()
+    anon = main.app.test_client()
+    assert anon.get('/ui').status_code == 200
+    assert anon.get(main.API_PATH).get_data(as_text=True) == 'Hello World!'
+    print('[OK] 清空密码：回到未设置状态（界面免登录、接口全拒）')
+
+
+def test_ui_page_never_leaks_password_hash(tmp_path, monkeypatch):
+    """页面里不能出现哈希本身、也不该出现键名——哈希交给浏览器就是半份口令。"""
+    cfg = tmp_path / 'config.yaml'
+    cfg.write_text(_UI_SAMPLE, encoding='utf-8')
+    client = ui_client(cfg, monkeypatch)
+    html = client.get('/ui').get_data(as_text=True)
+
+    assert _UI_SAMPLE_HASH not in html
+    assert _UI_SAMPLE_PW not in html
+    assert 'password_hash' not in html, '页面不该带上密码哈希的键名'
+    # 但「是否已设置密码」这个状态要告诉前端（决定表单形态）
+    assert '"password_set": true' in html, '缺 password_set 状态码'
+    print('[OK] /ui 页面不泄漏任何密码信息')
+
+
+def test_request_log_masks_password_fields():
+    """日志里的 password 字段必须被抹成 ***。
+
+    日志会被长期留存甚至外送。`Body=password=abc123` 原样写进去，
+    等于把「不存明文」的承诺换了个地方继续违反。
+    """
+    cases = [
+        'password=hunter2',
+        'username=admin&password=hunter2&next=/ui',
+        '{"old_password": "hunter2", "new_password": "hunter3"}',
+        '{"old_password":"hunter2"}',
+    ]
+    for raw in cases:
+        masked = main.mask_secret_fields(raw)
+        assert 'hunter' not in masked, '口令漏进日志: %r -> %r' % (raw, masked)
+        assert '***' in masked, masked
+    # 不该误伤无关内容
+    plain = 'sub_url=https://a.c/sub?token=x'
+    assert main.mask_secret_fields(plain) == plain
+    print('[OK] 请求日志：password 字段统一抹成 ***，其他内容不受影响')
 
 
 def test_split_config_blocks():
     """按顶层 key 切块：注释与缩进子项跟随所属段。"""
     blocks = main.split_config_blocks(_UI_SAMPLE)
     assert blocks['__head__'].startswith('# 文件头注释')
-    assert set(blocks) == {'__head__', 'password', 'cache_ttl', 'port',
+    assert set(blocks) == {'__head__', 'password_hash', 'cache_ttl', 'port',
                            'sub_url', 'sub_url1', 'proxies', 'proxy-groups',
                            'rules'}
-    assert blocks['password'].startswith('password: old-pw')
-    assert '# 访问密码' in blocks['password']
+    assert blocks['password_hash'].startswith('password_hash: %s' % _UI_SAMPLE_HASH)
+    assert '# 访问密码' in blocks['password_hash']
     assert blocks['proxies'].startswith('proxies:\n  - name: A')
     assert blocks['rules'].startswith('rules:\n')
     print('[OK] split_config_blocks：按顶层 key 切块，注释随段')
@@ -890,7 +1084,7 @@ def test_assemble_multiline_block():
     out = main.assemble_config(_UI_SAMPLE, {'rules': new_rules})
     parsed = yaml.safe_load(out)
     assert parsed['rules'] == ['DOMAIN-SUFFIX,foo.com,G1', 'MATCH,DIRECT']
-    assert parsed['port'] == 7890 and parsed['password'] == 'old-pw'
+    assert parsed['port'] == 7890 and parsed['password_hash'] == _UI_SAMPLE_HASH
     assert out.startswith('# 文件头注释')
     print('[OK] assemble_config：多行段整体替换，其他段完好')
 

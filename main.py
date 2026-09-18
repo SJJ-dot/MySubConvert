@@ -26,6 +26,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import time
@@ -61,7 +62,8 @@ SUB_URL_KEYS = ['sub_url'] + ['sub_url%d' % i for i in range(1, SUB_URL_COUNT + 
 # 控制配置项（不会出现在输出的 Clash 配置中，合并前会被剥离）
 CONTROL_KEYS = {
     'api_path',                     # 订阅接口路径（修改需重启）
-    'password',                     # 接口访问密码
+    'password',                     # 【兼容旧配置】接口访问密码（明文，加载后自动升级为哈希）
+    'password_hash',                # 接口访问密码的哈希（pbkdf2_sha256$...，唯一推荐写法）
     'basic_auth',                   # 动态更新 Home 节点 IP/端口 的基础认证 username:password
     'server_url',                   # 获取 Home 节点最新 IP/端口 的服务地址
     'cache_ttl',                    # 机场配置缓存时长（秒，0 表示不过期）
@@ -126,6 +128,7 @@ def log_request():
         body = '<binary>'
     if len(body) > 2000:
         body = body[:2000] + '...[truncated]'
+    body = mask_secret_fields(body)
 
     from urllib.parse import urlencode
     args_multi = request.args.to_dict(flat=False)
@@ -137,7 +140,7 @@ def log_request():
         k: (v[0] if isinstance(v, list) and len(v) == 1 else v)
         for k, v in sanitized_args.items()
     }
-    query = urlencode(sanitized_args, doseq=True)
+    query = mask_secret_fields(urlencode(sanitized_args, doseq=True))
     path = request.path + ('?' + query if query else '')
 
     logging.info(
@@ -147,6 +150,33 @@ def log_request():
     )
 
 
+# JSON / 表单里凡是名字带 password 的字段，值一律替换成 ***
+_SECRET_FIELD_RE = re.compile(
+    r'(["\']?[\w.-]*password[\w.-]*["\']?\s*[:=]\s*)'
+    r'("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|[^&\s,}]+)',
+    re.IGNORECASE)
+
+
+def _mask_secret_value(m):
+    """把值换成 `***`；带引号的值补回同种引号，免得把 JSON 文本写坏。"""
+    val = m.group(2)
+    return m.group(1) + ('%s***%s' % (val[0], val[0]) if val[:1] in ('"', "'")
+                         else '***')
+
+
+def mask_secret_fields(s):
+    """把报文里形如 `password=xx` / `"new_password": "xx"` 的值抹成 `***`。
+
+    请求日志是要长期留存（甚至外送）的明文文本，而登录表单、改密码接口、
+    订阅请求都带着口令：`Body=password=abc123` 会把口令原样写进日志 ——
+    相当于「换了个地方继续存明文」。所以**统一在写日志这一步**抹掉，
+    任何新接口只要字段名里带 password 就自动受益。
+    """
+    if not s:
+        return s
+    return _SECRET_FIELD_RE.sub(_mask_secret_value, s)
+
+
 # ===================== 配置加载 =====================
 # 配置缓存：内容未变时直接返回上次结果，避免每个请求都读盘 + 解析 YAML。
 # 用「文件内容哈希」而不是 mtime 作缓存键——mtime 粒度粗，保存后立刻重载会撞上
@@ -154,6 +184,125 @@ def log_request():
 _config_lock = threading.RLock()
 _config_cache = None      # (path, digest, control, template)
 _config_dirty = True      # 由网页界面置位，强制下次读取时重新加载
+
+
+# ===================== 访问密码：只保存哈希 =====================
+# config.yaml 会被界面读到、被备份、被 git 提交——明文口令一旦泄漏，
+# 等于把「订阅内容 + 配置编辑权」一起交出去。所以：
+#   - 配置里**只存哈希**：`password_hash: pbkdf2_sha256$迭代次数$salt$b64(摘要)`；
+#   - salt 每次随机：同一口令两次导出的哈希不同，拖库也凑不出彩虹表；
+#   - 迭代 20 万次：单次校验约 100ms，离线爆破成本高到不划算（stdlib 实现，无新依赖）；
+#   - **默认值为空**（未设置密码）：此时订阅接口一律拒绝，界面提示立即设置；
+#   - 旧配置里的明文 `password` 仍然认（否则升级就把自己锁在门外），
+#     但**首次加载就地改写成哈希**（见 migrate_legacy_password），明文不再落盘。
+PW_MIN_LEN = 8            # 新密码最短长度
+PW_MAX_LEN = 256
+PBKDF2_ITERATIONS = 200000
+_PW_ALGO = 'pbkdf2_sha256'
+_HASH_KEY = 'password_hash'
+_LEGACY_KEY = 'password'
+
+
+def hash_password(pw, iterations=PBKDF2_ITERATIONS):
+    """导出口令摘要：`pbkdf2_sha256$迭代次数$salt$摘要`（salt 每次随机）。"""
+    salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac('sha256', pw.encode('utf-8'), salt, iterations)
+    return '%s$%d$%s$%s' % (_PW_ALGO, iterations,
+                            base64.b64encode(salt).decode('ascii'),
+                            base64.b64encode(dk).decode('ascii'))
+
+
+def verify_password(pw, stored):
+    """校验明文口令：匹配哈希格式的存储值，也认旧配置里的明文。
+
+    空口令、空存储值一律算失败：未设置密码时不能被 `?password=` 空值绕过。
+    """
+    stored = str(stored or '')
+    pw = pw or ''
+    if not stored:
+        return False
+    if '$' not in stored:
+        # 旧配置的明文口令（加载时已尝试自动升级，这里只做兜底）
+        return hmac.compare_digest(pw.encode('utf-8'), stored.encode('utf-8'))
+    try:
+        algo, iters, salt_b64, hash_b64 = stored.split('$', 3)
+        if algo != _PW_ALGO:
+            return False
+        salt = base64.b64decode(salt_b64)
+        want = base64.b64decode(hash_b64)
+    except Exception:
+        logging.warning("password_hash 无法解析，按校验失败处理")
+        return False
+    got = hashlib.pbkdf2_hmac('sha256', pw.encode('utf-8'), salt, int(iters))
+    return hmac.compare_digest(got, want)
+
+
+def stored_password(control):
+    """配置里已保存的密码串（哈希优先，兼容旧明文）；未设置时返回 ''。"""
+    return str(control.get(_HASH_KEY) or control.get(_LEGACY_KEY) or '')
+
+
+def write_config_file(path, text):
+    """写回配置：先备份 .bak，再 tmp → replace 原子替换。
+
+    原子替换保证写一半断电也只会留下旧文件或新文件，不会出现半个文件。
+    """
+    if os.path.exists(path):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                old = f.read()
+            with open(path + '.bak', 'w', encoding='utf-8') as f:
+                f.write(old)
+        except Exception as e:
+            logging.warning("备份原配置失败（继续写入）: %s", e)
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def migrate_legacy_password(path, control):
+    """旧配置里的明文 `password` → `password_hash`（原地改写，明文不再落盘）。
+
+    只在「有明文、且尚没有哈希」时执行一次。行位置与行尾注释都保留，
+    界面上没有的字段也不会被整理掉；改写失败（配置只读挂载等）不影响本次使用
+    ——明文仍然有效，下次加载会再试一次。
+    """
+    plain = str(control.get(_LEGACY_KEY) or '')
+    if not plain or str(control.get(_HASH_KEY) or ''):
+        return control
+
+    hashed = hash_password(plain)
+    try:
+        with _config_lock:
+            with open(path, 'r', encoding='utf-8') as f:
+                text = f.read()
+            new_lines = []
+            replaced = False
+            for line in text.splitlines(keepends=True):
+                stripped = line.rstrip('\n').rstrip('\r')
+                # 只认 0 缩进的 `password:`：节点里的 `password: xxx` 是节点自己的东西
+                if not replaced and not line[:1].isspace() \
+                        and stripped.startswith(_LEGACY_KEY + ':'):
+                    idx = stripped.find(' #')
+                    comment = stripped[idx:] if idx >= 0 else ''
+                    new_lines.append('%s: %s%s\n' % (_HASH_KEY, hashed, comment))
+                    replaced = True
+                else:
+                    new_lines.append(line)
+            if not replaced:
+                return control
+            write_config_file(path, ''.join(new_lines))
+        logging.warning("检测到明文 password，已就地升级为 password_hash"
+                        "（%s 中不再保存明文）", os.path.basename(path))
+    except Exception as e:
+        logging.warning("明文密码升级为哈希失败，本次继续使用旧配置: %s", e)
+        return control
+
+    control = dict(control)
+    control.pop(_LEGACY_KEY, None)
+    control[_HASH_KEY] = hashed
+    return control
 
 
 def read_yaml_config(file_path):
@@ -193,6 +342,8 @@ def load_local_config(path=CONFIG_FILE):
         raw = read_yaml_config(path) or {}
         control = {k: raw.get(k) for k in CONTROL_KEYS if k in raw}
         template = {k: v for k, v in raw.items() if k not in CONTROL_KEYS}
+        # 旧配置里的明文口令：就地升级为哈希（失败也不影响本次使用）
+        control = migrate_legacy_password(path, control)
         _config_cache = (path, digest, control, template)
         _config_dirty = False
         return control, template
@@ -577,8 +728,12 @@ _load_cache_file()
 @app.route(API_PATH)
 def api():
     control, template = load_local_config()
-    password = request.args.get('password')
-    if password != str(control.get('password', '')):
+    stored = stored_password(control)
+    if not stored:
+        # 没设密码时的默认行为是「一律拒绝」：宁可配不出来，也不能把订阅交给陌生人
+        logging.warning("未设置访问密码，订阅接口拒绝请求（请到 /ui 里设置密码）")
+        return 'Hello World!'
+    if not verify_password(request.args.get('password'), stored):
         return 'Hello World!'
 
     refresh_proxy_ip_port(control)
@@ -602,34 +757,46 @@ def health():
 
 
 # ===================== 网页配置界面 =====================
-# 界面已暴露到公网，因此**必须登录**才能访问（密码即 config.yaml 的 password）。
+# 界面已暴露到公网，因此**必须登录**才能访问（唯一例外：还没设置密码的首次部署，
+# 否则连「设置密码」这一步都进不去）。密码只在哈希形态下保存与校验；
 # 登录后发放一个 HMAC 签名的短期 cookie，避免每次请求都带明文密码。
 # 保存后直接写回 config.yaml 并热重载，无需重启。
 
 # ===================== 网页界面登录 =====================
 # 设计要点：
-#  - 密码复用 config.yaml 里的 `password`（与订阅接口同一个），不再引入第二套口令；
+#  - 密码复用 config.yaml 的访问控制项（与订阅接口同一个），不再引入第二套口令；
 #  - 只用签名 cookie 记登录态，cookie 里放**过期时间戳**，不含密码本身；
 #  - 签名密钥进程启动时随机生成 → 重启即全部登出（简单且安全，不用落盘密钥）；
-#  - 明文密码比对用 hmac.compare_digest，避免时序侧信道。
+#  - 签名里带上当前密码的指纹 → **改密码后其他会话立即失效**（改完当场登出别人）；
+#  - 配置里只存 PBKDF2 哈希，校验走 hmac.compare_digest（避开时序侧信道）。
 UI_SESSION_COOKIE = 'mysub_ui'
 UI_SESSION_TTL = 7 * 24 * 3600          # 7 天
 # 每次进程启动随机生成：重启后旧 cookie 自动失效
 UI_SECRET = secrets.token_bytes(32)
 
 
-def _ui_password():
-    """当前界面密码（取自 config.yaml 的 password，热重载后立即生效）。"""
+def _ui_stored_password():
+    """当前保存的密码串（哈希，热重载后立即生效）；未设置时返回 ''。"""
     try:
         control, _ = load_local_config()
-        return str(control.get('password', '') or '')
+        return stored_password(control)
     except Exception:
         return ''
 
 
+def _pw_fingerprint():
+    """当前密码的指纹。
+
+    它参与 cookie 签名后，「改密码」这件事会自然让之前发出的 cookie 全部失效，
+    不必另外维护会话黑名单，也没有多余状态要落盘。
+    """
+    return hashlib.sha256(_ui_stored_password().encode('utf-8')).hexdigest()[:16]
+
+
 def _ui_sign(ts):
-    """对过期时间戳签名。"""
-    return hmac.new(UI_SECRET, str(ts).encode('utf-8'), hashlib.sha256).hexdigest()
+    """对「过期时间戳 + 密码指纹」签名。"""
+    payload = '%d.%s' % (ts, _pw_fingerprint())
+    return hmac.new(UI_SECRET, payload.encode('utf-8'), hashlib.sha256).hexdigest()
 
 
 def _ui_make_token():
@@ -657,8 +824,15 @@ def ui_authed():
 
 
 def ui_login_required():
-    """未登录时的统一响应：网页跳登录页，接口返回 401 JSON。"""
+    """未登录时的统一响应：网页跳登录页，接口返回 401 JSON。
+
+    例外：**还没设置密码**时直接放行——否则首次部署的人连「设置密码」的界面
+    都进不去（又不想回到手工编辑 config.yaml 的老路上）。此时订阅接口仍然是
+    全拒状态，敞开的只是这一个界面，且页面顶部会用醒目横幅催一句。
+    """
     if ui_authed():
+        return None
+    if not _ui_stored_password():
         return None
     if request.path.startswith('/ui/') and request.path != '/ui/login':
         return jsonify({'ok': False, 'error': '未登录或登录已过期，请刷新页面重新登录'}), 401
@@ -705,7 +879,8 @@ UI_LOGIN_HEAD = """<!DOCTYPE html>
   <input type="hidden" name="next" value="__NEXT__">
   <button type="submit">登录</button>
   <div id="err">__ERR__</div>
-  <p class="hint">用户名任意填写、不做校验；密码即 config.yaml 中的 password（与订阅接口相同）。</p>
+  <p class="hint">用户名任意填写、不做校验；密码与订阅接口 ?password= 是同一个，
+    配置里只保存它的哈希（看不到明文）。</p>
 </form>
 </body>
 </html>
@@ -714,6 +889,11 @@ UI_LOGIN_HEAD = """<!DOCTYPE html>
 
 @app.route('/ui/login', methods=['GET', 'POST'])
 def ui_login():
+    stored = _ui_stored_password()
+    # 还没设密码：没有东西可以「登录」，直接去界面把它设上
+    if request.method == 'GET' and not stored and not ui_authed():
+        return redirect('/ui', code=302)
+
     if request.method == 'GET':
         if ui_authed():
             return redirect(request.args.get('next') or '/ui', code=302)
@@ -726,13 +906,7 @@ def ui_login():
     # 只允许站内跳转，避免被当成开放重定向跳板
     if not nxt.startswith('/') or nxt.startswith('//'):
         nxt = '/ui'
-    expect = _ui_password()
-    if not expect:
-        html = UI_LOGIN_HEAD.replace('__NEXT__', _html_escape(nxt))
-        return Response(html.replace('__ERR__',
-                       'config.yaml 里没有配置 password，请先在本地配置文件里设置一个'),
-                       status=500, mimetype='text/html')
-    if not hmac.compare_digest(pw, expect):
+    if stored and not verify_password(pw, stored):
         logging.warning("网页界面登录失败（来源 %s）", request.remote_addr)
         html = UI_LOGIN_HEAD.replace('__NEXT__', _html_escape(nxt))
         return Response(html.replace('__ERR__', '密码错误'), status=403,
@@ -789,11 +963,13 @@ UI_HEAD = """<!DOCTYPE html>
   .card .body { padding:16px; }
   .hint { font-size:12px; color:var(--mut); }
   label { font-size:13px; color:#3d4555; font-weight:500; display:block; margin-bottom:6px; }
-  select, input[type=text] { border:1px solid var(--bd); border-radius:6px;
-        padding:9px 11px; font-size:13px; font-family:inherit; background:#fff; }
-  input[type=text] { width:100%; }
-  select:focus, input[type=text]:focus { outline:none; border-color:var(--pri);
-        box-shadow:0 0 0 3px rgba(47,111,237,.12); }
+  select, input[type=text], input[type=password] { border:1px solid var(--bd);
+        border-radius:6px; padding:9px 11px; font-size:13px; font-family:inherit;
+        background:#fff; }
+  input[type=text], input[type=password] { width:100%; }
+  select:focus, input[type=text]:focus, input[type=password]:focus { outline:none;
+        border-color:var(--pri); box-shadow:0 0 0 3px rgba(47,111,237,.12); }
+  input[type=password]:disabled { background:#f5f7fa; color:var(--mut); }
   .row { display:flex; gap:14px; align-items:flex-end; flex-wrap:wrap; }
   .row .col { display:flex; flex-direction:column; }
   .row .col.grow { flex:1; min-width:260px; }
@@ -802,6 +978,40 @@ UI_HEAD = """<!DOCTYPE html>
   #msg.err { background:#fdecec; color:var(--err); border:1px solid #f3b3b3; }
   .stat { font-size:12px; color:var(--mut); display:flex; gap:16px; flex-wrap:wrap; }
   .stat b { color:#252b37; font-weight:600; }
+  /* 未设置密码的顶部横幅：默认安装就是空密码，必须催着改 */
+  #nopw { max-width:1180px; margin:16px auto 0; padding:11px 15px;
+          border:1px solid #f0cf9a; background:#fff7e8; border-radius:10px;
+          color:var(--warn); font-size:13px; display:none; align-items:center; gap:12px; }
+  #nopw .grow { flex:1; }
+  #nopw button { padding:5px 12px; font-size:13px; }
+
+  /* ---- 右上角「访问密码」弹窗 ---- */
+  .mask { position:fixed; inset:0; background:rgba(20,26,38,.45); z-index:50;
+          display:none; align-items:center; justify-content:center; padding:20px; }
+  .modal { background:#fff; border-radius:12px; width:100%; max-width:540px;
+           box-shadow:0 18px 48px rgba(20,26,38,.25); overflow:hidden; }
+  .modal h3 { margin:0; padding:14px 18px; font-size:15px; font-weight:600;
+              border-bottom:1px solid var(--bd); display:flex; align-items:center; gap:10px; }
+  .modal h3 .tag { font-size:12px; color:var(--mut); font-weight:400; }
+  .modal .body { padding:18px; }
+  .modal .body .row .col.grow { min-width:200px; }
+  .modal .body .row .col:not(.grow) { flex:1; min-width:200px; }
+  .modal .body input[type=password] { margin-top:0; }
+  .modal-acts { display:flex; gap:10px; align-items:center; margin-top:18px; }
+  .modal-acts .grow { flex:1; }
+  #btn-pw-open.attn { border-color:var(--warn); color:var(--warn); background:#fff7e8; }
+  #btn-pw-open.attn:hover { border-color:var(--warn); color:var(--warn); opacity:.85; }
+
+  /* ---- 折叠卡片：本地节点 / 其他配置 默认收起 ---- */
+  details.card > summary { font-size:14px; padding:12px 16px; font-weight:600;
+               display:flex; align-items:center; gap:10px; cursor:pointer;
+               user-select:none; list-style:none; }
+  details.card > summary::-webkit-details-marker { display:none; }
+  details.card > summary .tag { font-size:12px; color:var(--mut); font-weight:400; }
+  details.card > summary .tip { margin-left:auto; font-size:12px; color:var(--mut);
+                                font-weight:400; }
+  details.card > summary:hover { color:var(--pri); }
+  details.card > .body { border-top:1px solid var(--bd); }
 
   /* ---- 规则编辑表格 ---- */
   .rules-toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap;
@@ -832,7 +1042,7 @@ UI_HEAD = """<!DOCTYPE html>
   details.adv textarea { width:100%; margin-top:10px; border:1px solid var(--bd);
         border-radius:6px; padding:10px; font-family:ui-monospace,Consolas,monospace;
         font-size:12.5px; line-height:1.6; resize:vertical; }
-  main > .card > .body > textarea { width:100%; margin-top:12px; border:1px solid var(--bd);
+  main .card > .body > textarea { width:100%; margin-top:12px; border:1px solid var(--bd);
         border-radius:6px; padding:10px; font-family:ui-monospace,Consolas,monospace;
         font-size:12.5px; line-height:1.6; resize:vertical; }
   table.rules textarea { padding:6px 8px; border:1px solid var(--bd); border-radius:6px;
@@ -845,10 +1055,16 @@ UI_HEAD = """<!DOCTYPE html>
   <span class="stat" id="stat"></span>
   <span class="grow"></span>
   <span id="msg"></span>
+  <button id="btn-pw-open">访问密码</button>
   <button id="btn-reload">重新载入</button>
   <button id="btn-save" class="pri">保存并生效</button>
   <a href="/ui/logout"><button type="button">退出</button></a>
 </header>
+<div id="nopw">
+  <span class="grow">⚠️ 当前<b>没有</b>访问密码：任何人都能打开本页并修改配置
+    （订阅接口在此期间一律拒绝）。</span>
+  <button type="button" id="nopw-set">立即设置</button>
+</div>
 <main>
   <!-- ============ 订阅链接 ============ -->
   <div class="card">
@@ -910,60 +1126,6 @@ UI_HEAD = """<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- ============ 本地节点 ============ -->
-  <div class="card">
-    <h2>本地节点 <span class="tag">不走机场、直接写在本地配置里的节点（如回家用的 Home）</span></h2>
-    <div class="body">
-      <div class="rules-toolbar">
-        <span class="hint" id="px-count"></span>
-        <span class="grow"></span>
-        <button id="btn-add-proxy">+ 新增节点</button>
-      </div>
-      <table class="rules" id="px-table">
-        <thead>
-          <tr>
-            <th style="width:26px"></th>
-            <th style="width:34px"></th>
-            <th style="width:20%">名称</th>
-            <th style="width:130px">类型</th>
-            <th style="width:24%">服务器</th>
-            <th style="width:100px">端口</th>
-            <th style="width:110px">操作</th>
-          </tr>
-        </thead>
-        <tbody id="px-body"></tbody>
-      </table>
-      <div class="empty" id="px-empty" style="display:none">暂无本地节点</div>
-      <details class="adv">
-        <summary>高级：直接编辑 proxies 原文</summary>
-        <p class="hint" style="margin:8px 0 0">
-          表格只编辑名称 / 类型 / 服务器 / 端口；密码、加密方式、udp 等协议参数在原文里改。
-          <b>改完点「用文本覆盖表格」</b>——保存时以表格为准，不点的话原文里的改动会被丢弃。
-        </p>
-        <textarea id="px-raw" rows="8" spellcheck="false"></textarea>
-        <div style="margin-top:10px">
-          <button id="btn-px-apply">用文本覆盖表格</button>
-          <button id="btn-px-sync">从表格同步到文本</button>
-        </div>
-      </details>
-    </div>
-  </div>
-
-  <!-- ============ 其他配置 ============ -->
-  <div class="card">
-    <h2>其他配置 <span class="tag">端口 / DNS / 客户端行为等；按段编辑，保存不会改动其他段</span></h2>
-    <div class="body">
-      <div class="row">
-        <div class="col grow">
-          <label for="ex-key">配置段</label>
-          <select id="ex-key"></select>
-        </div>
-      </div>
-      <p class="hint" id="ex-note" style="margin:10px 0 0"></p>
-      <textarea id="ex-raw" rows="10" spellcheck="false"></textarea>
-    </div>
-  </div>
-
   <!-- ============ 代理规则 ============ -->
   <div class="card">
     <h2>代理规则 <span class="tag">自上而下匹配，首条命中生效；末行建议保留 MATCH 兜底</span></h2>
@@ -1005,7 +1167,98 @@ UI_HEAD = """<!DOCTYPE html>
       </details>
     </div>
   </div>
+
+  <!-- ============ 本地节点（不常用，放最底部，默认折叠） ============ -->
+  <details class="card" id="card-px">
+    <summary>本地节点 <span class="tag">不走机场、直接写在本地配置里的节点</span>
+      <span class="tip">点击展开</span>
+    </summary>
+    <div class="body">
+      <div class="rules-toolbar">
+        <span class="hint" id="px-count"></span>
+        <span class="grow"></span>
+        <button id="btn-add-proxy">+ 新增节点</button>
+      </div>
+      <table class="rules" id="px-table">
+        <thead>
+          <tr>
+            <th style="width:26px"></th>
+            <th style="width:34px"></th>
+            <th style="width:20%">名称</th>
+            <th style="width:130px">类型</th>
+            <th style="width:24%">服务器</th>
+            <th style="width:100px">端口</th>
+            <th style="width:110px">操作</th>
+          </tr>
+        </thead>
+        <tbody id="px-body"></tbody>
+      </table>
+      <div class="empty" id="px-empty" style="display:none">暂无本地节点</div>
+      <details class="adv">
+        <summary>高级：直接编辑 proxies 原文</summary>
+        <p class="hint" style="margin:8px 0 0">
+          表格只编辑名称 / 类型 / 服务器 / 端口；密码、加密方式、udp 等协议参数在原文里改。
+          <b>改完点「用文本覆盖表格」</b>——保存时以表格为准，不点的话原文里的改动会被丢弃。
+        </p>
+        <textarea id="px-raw" rows="8" spellcheck="false"></textarea>
+        <div style="margin-top:10px">
+          <button id="btn-px-apply">用文本覆盖表格</button>
+          <button id="btn-px-sync">从表格同步到文本</button>
+        </div>
+      </details>
+    </div>
+  </details>
+
+  <!-- ============ 其他配置（不常用，放最底部，默认折叠） ============ -->
+  <details class="card" id="card-ex">
+    <summary>其他配置 <span class="tag">端口 / DNS / 客户端行为等；按段编辑</span>
+      <span class="tip">点击展开</span>
+    </summary>
+    <div class="body">
+      <div class="row">
+        <div class="col grow">
+          <label for="ex-key">配置段</label>
+          <select id="ex-key"></select>
+        </div>
+      </div>
+      <p class="hint" id="ex-note" style="margin:10px 0 0"></p>
+      <textarea id="ex-raw" rows="10" spellcheck="false"></textarea>
+    </div>
+  </details>
 </main>
+
+<!-- ============ 访问密码弹窗（入口在右上角） ============ -->
+<div class="mask" id="pw-mask">
+  <div class="modal">
+    <h3>访问密码 <span class="tag">配置里只保存哈希，看不到也推不出明文</span></h3>
+    <div class="body">
+      <div class="row">
+        <div class="col grow">
+          <label for="pw-old">当前密码</label>
+          <input type="password" id="pw-old" autocomplete="current-password"
+                 spellcheck="false" placeholder="未设置密码时无需填写">
+        </div>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <div class="col grow">
+          <label for="pw-new">新密码<span class="hint">　至少 8 位，留空表示清除密码</span></label>
+          <input type="password" id="pw-new" autocomplete="new-password" spellcheck="false">
+        </div>
+        <div class="col grow">
+          <label for="pw-new2">确认新密码</label>
+          <input type="password" id="pw-new2" autocomplete="new-password" spellcheck="false">
+        </div>
+      </div>
+      <p class="hint" id="pw-note" style="margin:12px 0 0"></p>
+      <div class="modal-acts">
+        <button id="btn-pw-clear" class="danger" style="display:none">清除密码</button>
+        <span class="grow"></span>
+        <button id="btn-pw-cancel">取消</button>
+        <button id="btn-pw" class="pri">设置密码</button>
+      </div>
+    </div>
+  </div>
+</div>
 <script>
 const F = __FIELDS__, RAW = __RAW__;
 </script>
@@ -1774,6 +2027,74 @@ function flash(text, ok) {
   if (ok) setTimeout(() => { m.style.display = 'none'; }, 3500);
 }
 
+/* ---------------- 访问密码：在界面里改（后端只落哈希） ---------------- */
+// 密码**不走「保存并生效」那条路**：那里会把配置原文逐块带回服务端，
+// 明文口令混进去就可能被写进 config.yaml / .bak / 日志。改密码有独立接口，
+// 服务端收到明文后只导出 PBKDF2 摘要再写盘。
+const PW_MIN = F.password_min || 8;
+let pwSet = !!F.password_set;
+
+function refreshPw() {
+  $('#pw-old').disabled = !pwSet;
+  $('#btn-pw').textContent = pwSet ? '修改密码' : '设置密码';
+  $('#btn-pw-clear').style.display = pwSet ? '' : 'none';
+  $('#nopw').style.display = pwSet ? 'none' : 'flex';
+  // 右上角入口：没密码时标成橙色提醒，按钮文案也跟着变
+  const open = $('#btn-pw-open');
+  open.textContent = pwSet ? '访问密码' : '设置密码';
+  open.classList.toggle('attn', !pwSet);
+  $('#pw-note').textContent = pwSet
+    ? '改完立即生效：旧密码当场作废，之前登录的会话（本页除外）需要重新登录，'
+      + '订阅接口同步改用新密码。'
+    : '还没有密码：任何人都能打开本页修改配置，订阅接口则一律拒绝。'
+      + '建议现在设一个（至少 ' + PW_MIN + ' 位）。';
+}
+
+function openPw() {
+  $('#pw-old').value = $('#pw-new').value = $('#pw-new2').value = '';
+  refreshPw();
+  $('#pw-mask').style.display = 'flex';
+  // 弹窗刚显示时元素还不可聚焦，下一帧再 focus
+  setTimeout(() => (pwSet ? $('#pw-old') : $('#pw-new')).focus(), 30);
+}
+
+function closePw() { $('#pw-mask').style.display = 'none'; }
+
+// clear=true 表示「清除密码」：新密码按空串提交
+async function changePassword(clear) {
+  const old = $('#pw-old').value;
+  const n1 = clear ? '' : $('#pw-new').value;
+  const n2 = clear ? '' : $('#pw-new2').value;
+  if (!clear && n1 !== n2) { flash('两次输入的新密码不一致', false); return; }
+  if (n1 && n1.length < PW_MIN) { flash('密码至少 ' + PW_MIN + ' 位', false); return; }
+  if (!n1 && pwSet && !confirm('清除密码后任何人都能打开本界面并修改配置，确定继续？')) return;
+  if (!n1 && !pwSet) { flash('当前没有密码，无需清除', false); return; }
+  if (pwSet && !old) { flash('请先填写当前密码', false); return; }
+  try {
+    const r = await fetch('/ui/password', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ old_password: old, new_password: n1 })
+    });
+    const j = await r.json();
+    if (!j.ok) { flash(j.error || '修改失败', false); return; }
+    pwSet = !!n1;
+    closePw();
+    refreshPw();
+    flash(n1 ? '密码已更新：旧会话需重新登录' : '已清除密码（本界面不再校验登录）', true);
+  } catch (e) { flash('修改失败: ' + e, false); }
+}
+
+$('#btn-pw-open').addEventListener('click', openPw);
+$('#nopw-set').addEventListener('click', openPw);
+$('#btn-pw-cancel').addEventListener('click', closePw);
+$('#btn-pw').addEventListener('click', () => changePassword(false));
+$('#btn-pw-clear').addEventListener('click', () => changePassword(true));
+// 点遮罩空白处关闭；弹窗内部点击不冒泡出去
+$('#pw-mask').addEventListener('click', e => { if (e.target === $('#pw-mask')) closePw(); });
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && $('#pw-mask').style.display === 'flex') closePw();
+});
+
 $('#btn-save').addEventListener('click', async () => {
   const before = curSlot;
   try {
@@ -1921,6 +2242,7 @@ renderExtraSelect();
 showExtra(F.extra_keys.length ? F.extra_keys[0].key : null);
 $('#rules-raw').value = rules.map(joinRule).filter(Boolean).join('\\n');
 refreshStat();
+refreshPw();
 </script>
 </body>
 </html>
@@ -2081,12 +2403,15 @@ def assemble_config(text, updates):
             out.append(_segment_body(text, key))   # 及其续行
             continue
         new = updates[key]
+        if new is None:
+            continue                     # None = 删除该段（含其续行）
         # 替换体若自带**本段自己**的 `key:` 首行，就是「整段替换」，不再套单行格式，
         # 否则会写出 `rules: rules:` 这种双重 header。
         # 必须比对 key 名：单行值里的 `https://...` 也长得像 `key:`，不能误判。
         m_new = _TOP_KEY_RE.match(new.lstrip('\n'))
         has_header = bool(m_new) and m_new.group(1) == key
-        if not has_header and (key in _LINE_KEYS or _is_line_block(line)):
+        if not has_header and (key in _LINE_KEYS or _is_line_block(line)
+                               or not _is_block_text(new)):
             # 单行段：只换值，保留行尾注释
             old_line = line.rstrip('\n').rstrip('\r')
             comment = ''
@@ -2099,7 +2424,7 @@ def assemble_config(text, updates):
             out.append(body)
 
     for key, new in updates.items():
-        if key not in seen:
+        if key not in seen and new is not None:
             # 原文没有这个段：单行段按 `key: value` 追加，其余按整段写入。
             if key in _LINE_KEYS or (_TOP_KEY_RE.match(new.lstrip('\n')) is None
                                      and not new.strip().startswith('-')):
@@ -2108,6 +2433,19 @@ def assemble_config(text, updates):
                 body = new if new.endswith('\n') else new + '\n'
                 out.append(body)
     return ''.join(out)
+
+
+def _is_block_text(new):
+    """新内容是「整段文本」还是「一个单行标量」。
+
+    多行段（自带 `key:` 首行或列表项）必须整段替换；单行标量则要按 `key: value`
+    写回。这里的判定**只看新内容自身**：原文里 `password_hash:` 这种「冒号后写空」
+    的行（YAML 里等于 None，很常见）会让 `_is_line_block` 判成 False，此时若新
+    内容只是个单行值（哈希串），就只能按单行写——否则会把 `key:` 整个丢掉，
+    写出 `pbkdf2_sha256$...` 这种没有键名的坏配置。
+    """
+    s = str(new or '').lstrip('\n')
+    return '\n' in s.rstrip('\n') or s.startswith('-') or s.lstrip().startswith('-')
 
 
 def _is_line_block(line):
@@ -2572,6 +2910,10 @@ def ui():
         'cache_ttl': control_int(control, 'cache_ttl', DEFAULT_CACHE_TTL),
         'sub_url_count': sum(1 for k in SUB_URL_KEYS if control.get(k)),
         'targets': _ui_targets(template),
+        # 是否已设置密码（决定界面上的表单形态与顶部提示），
+        # 只给「有没有」，**绝不回传哈希本身**
+        'password_set': bool(stored_password(control)),
+        'password_min': PW_MIN_LEN,
         # 「其他配置」下拉：只列出**配置里确实存在**的段，避免界面推荐一堆空段
         'extra_keys': [{'key': k, 'label': lbl} for k, lbl in _EXTRA_KEYS
                        if k in split_config_blocks(text)],
@@ -2646,13 +2988,7 @@ def ui_save():
 
     old_api_path = API_PATH
     try:
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE + '.bak', 'w', encoding='utf-8') as f:
-                f.write(text)
-        tmp = CONFIG_FILE + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as f:
-            f.write(new_text)
-        os.replace(tmp, CONFIG_FILE)
+        write_config_file(CONFIG_FILE, new_text)
     except Exception as e:
         logging.error("网页界面保存失败: %s", e)
         return jsonify({'ok': False, 'error': '写入失败：%s' % e})
@@ -2662,6 +2998,81 @@ def ui_save():
     new_api = '/' + str(control.get('api_path', 'api')).lstrip('/')
     logging.info("网页界面已保存配置并热重载: %s", sorted(updates))
     return jsonify({'ok': True, 'restart_hint': new_api != old_api_path})
+
+
+@app.route('/ui/password', methods=['POST'])
+def ui_change_password():
+    """修改访问密码：`{old_password, new_password}` → 只把哈希写进 config.yaml。
+
+    - 已经设了密码就必须先验旧密码（防他人路过改口令把自己顶出去）；
+    - 新密码**只在内存里过一手**：导出 PBKDF2 摘要后立刻丢弃明文，
+      配置文件、备份、日志里都不会出现它；
+    - 写回前照样用 `password: None` 把旧的明文 `password:` 行删干净；
+    - 改完必须给当前会话补一枚新 cookie：cookie 签名里带着密码指纹，
+      旧的那枚当场失效（别人的会话也随之失效）。
+    """
+    need = ui_login_required()
+    if need is not None:
+        return need
+
+    data = request.get_json(silent=True) or {}
+    old_pw = str(data.get('old_password') or '')
+    new_pw = str(data.get('new_password') or '')
+
+    control, _ = load_local_config()
+    stored = stored_password(control)
+    if stored and not verify_password(old_pw, stored):
+        logging.warning("修改密码失败：原密码不正确（来源 %s）", request.remote_addr)
+        return jsonify({'ok': False, 'error': '原密码不正确'}), 403
+
+    if new_pw:
+        if len(new_pw) < PW_MIN_LEN:
+            return jsonify({'ok': False,
+                            'error': '密码至少 %d 位' % PW_MIN_LEN})
+        if len(new_pw) > PW_MAX_LEN:
+            return jsonify({'ok': False,
+                            'error': '密码最长 %d 位' % PW_MAX_LEN})
+        hashed = hash_password(new_pw)   # 明文的唯一用途：导出摘要
+    else:
+        if not stored:
+            return jsonify({'ok': False, 'error': '当前没有密码，无需清空'})
+        hashed = ''                      # 清空密码（回到默认：界面免登录）
+
+    try:
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            text = f.read()
+    except Exception as e:
+        return jsonify({'ok': False, 'error': '读取配置失败：%s' % e})
+
+    new_text = assemble_config(text, {_HASH_KEY: hashed, _LEGACY_KEY: None})
+    try:
+        parsed = yaml.safe_load(new_text)
+        if not isinstance(parsed, dict):
+            raise ValueError('解析结果不是 YAML 字典')
+        # 自检：写盘前先确认解析器读回的就是这枚新哈希。
+        # 单行/整段的判定一旦走错，`password_hash:` 会被写成没有键名的裸串
+        # （YAML 仍然「能解析」成别的形状，但语义完全错了），这里把它挡住。
+        if str(parsed.get(_HASH_KEY) or '') != hashed:
+            raise ValueError('password_hash 未正确写回（读到 %r）'
+                             % parsed.get(_HASH_KEY))
+    except Exception as e:
+        logging.error("修改密码被拒绝，新配置未通过校验: %s", e)
+        return jsonify({'ok': False, 'error': '配置校验失败：%s' % e})
+
+    try:
+        write_config_file(CONFIG_FILE, new_text)
+    except Exception as e:
+        logging.error("修改密码写入失败: %s", e)
+        return jsonify({'ok': False, 'error': '写入失败：%s' % e})
+
+    invalidate_config()
+    logging.info("访问密码已%s（来源 %s）",
+                 '更新' if hashed else '清空', request.remote_addr)
+    resp = jsonify({'ok': True, 'cleared': not hashed})
+    # 签名里含密码指纹：旧 cookie 已失效，给当前这枚续上
+    resp.set_cookie(UI_SESSION_COOKIE, _ui_make_token(), max_age=UI_SESSION_TTL,
+                    httponly=True, samesite='Lax')
+    return resp
 
 
 if __name__ == '__main__':
