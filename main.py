@@ -21,6 +21,7 @@ from gevent import monkey
 monkey.patch_all()
 
 import base64
+import errno
 import hashlib
 import hmac
 import json
@@ -242,10 +243,58 @@ def stored_password(control):
     return str(control.get(_HASH_KEY) or control.get(_LEGACY_KEY) or '')
 
 
+# os.replace 在这些 errno 上会失败但值得降级重试（其余照旧抛出）
+_REPLACE_RETRY_ERRNOS = (
+    getattr(errno, 'EBUSY', None),
+    getattr(errno, 'EPERM', None),
+    getattr(errno, 'EACCES', None),
+    getattr(errno, 'EXDEV', None),
+    getattr(errno, 'EROFS', None),
+)
+
+
+def replace_file(tmp, path):
+    """用 `tmp` 的内容替换 `path`：优先原子替换，被文件系统拒绝时降级为原地覆盖写。
+
+    Docker 把宿主机**单个文件** bind mount 进容器时
+    （`-v ./config.yaml:/app/config.yaml`），往挂载点上 rename 会被内核拒绝：
+    `Errno 16 Device or resource busy`——这是 bind mount 的固有行为，和权限无关，
+    容器里手动 `mv config.yaml.tmp config.yaml` 也是同样的错；而宿主机上下载改写
+    后上传是对**宿主机那一侧**的文件操作，不受影响，所以会有「手动能改、界面保存
+    报错」的差别。
+
+    降级路径：直接打开原文件覆盖写（写前已经备份过 `.bak`），原子性差一点，但
+    内容完整性与原来一致；确实只读（`EROFS` 等）时会在这里抛出明确错误。
+    """
+    try:
+        os.replace(tmp, path)
+        return
+    except OSError as e:
+        if e.errno not in _REPLACE_RETRY_ERRNOS:
+            raise
+        logging.warning("原子替换 %s 失败（%s），改为原地覆盖写",
+                        os.path.basename(path), e)
+
+    try:
+        with open(tmp, 'r', encoding='utf-8') as src:
+            data = src.read()
+        with open(path, 'w', encoding='utf-8') as dst:
+            dst.write(data)
+            dst.flush()
+            os.fsync(dst.fileno())
+    finally:
+        # 原地写成功与否都不留垃圾：tmp 已经无用（或压根没写成）
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
 def write_config_file(path, text):
     """写回配置：先备份 .bak，再 tmp → replace 原子替换。
 
-    原子替换保证写一半断电也只会留下旧文件或新文件，不会出现半个文件。
+    原子替换保证写一半断电也只会留下旧文件或新文件，不会出现半个文件；
+    目标文件被 bind mount（Docker）时自动降级为原地覆盖写，见 `replace_file`。
     """
     if os.path.exists(path):
         try:
@@ -258,7 +307,9 @@ def write_config_file(path, text):
     tmp = path + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
         f.write(text)
-    os.replace(tmp, path)
+        f.flush()
+        os.fsync(f.fileno())
+    replace_file(tmp, path)
 
 
 def migrate_legacy_password(path, control):
@@ -439,7 +490,10 @@ def _save_cache_file():
     try:
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(snapshot, f, ensure_ascii=False)
-        os.replace(tmp, SUBCACHE_FILE)
+            f.flush()
+            os.fsync(f.fileno())
+        # 同样照顾 bind mount 的缓存文件（替换不了就原地覆盖写）
+        replace_file(tmp, SUBCACHE_FILE)
     except Exception as e:
         logging.error("写入订阅缓存文件失败 %s: %s", SUBCACHE_FILE, e)
 

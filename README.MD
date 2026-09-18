@@ -435,7 +435,23 @@ services:
       - ./config.yaml:/app/config.yaml          # 外部配置，改配置无需重建镜像
 ```
 
-> 宿主机修改 `config.yaml` 后，执行 `docker restart mysubconvert` 生效（`api_path` 修改需重启进程）。
+> 宿主机修改 `config.yaml` 后，执行 `docker restart mysubconvert` 生效（`api_path` 修改需重启进程）；
+> 在网页界面里改则是即时热重载，无需重启。
+
+#### 为什么「手动改能行，界面保存却报错」
+
+单文件 bind mount（`-v ./config.yaml:/app/config.yaml`）下，**往挂载点上 rename 会被内核拒绝**：
+
+```
+写入失败：[Errno 16] Device or resource busy: '/app/config.yaml.tmp' -> '/app/config.yaml'
+```
+
+这是 bind mount 的固有行为，与权限无关——容器里手动执行同样的 `mv config.yaml.tmp config.yaml`
+也会报这个错；而下载到宿主机上编辑再上传，操作的是宿主机那一侧的文件，不受影响。
+
+程序的应对（`replace_file`）：先尝试 `tmp → replace` 原子替换，被文件系统拒绝时自动降级为
+**打开原文件原地覆盖写**（写前已备份 `config.yaml.bak`），所以界面保存能正常写入；只有真正
+只读挂载时才报错。原子替换失败会在日志里留一条 warning，属正常提示，不影响使用。
 
 ### 本地
 
